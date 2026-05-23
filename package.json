@@ -3,79 +3,49 @@
   "version": "0.0.1",
   "private": true,
   "license": "Apache-2.0",
-  "description": "Native desktop realtime translator for macOS and Windows using OpenAI Realtime translation.",
-  "main": "dist/main/main.js",
+  "description": "Zero Native desktop realtime translator using OpenAI Realtime translation.",
   "type": "module",
   "scripts": {
-    "dev": "npm run build && concurrently -k \"vite --host 127.0.0.1\" \"wait-on tcp:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
+    "dev": "npm run build:backend && zig build && concurrently -k \"node --max-old-space-size=32 --max-semi-space-size=1 dist/backend/server.js\" \"CO_TRANSLATOR_EXTERNAL_BACKEND=1 zero-native dev --binary zig-out/bin/co-translator\"",
+    "dev:frontend": "vite --host 127.0.0.1",
+    "dev:backend": "node --max-old-space-size=32 --max-semi-space-size=1 dist/backend/server.js",
     "version": "node scripts/version.mjs",
     "version:check": "node scripts/version.mjs --check",
-    "typecheck": "tsc --noEmit && tsc -p tsconfig.node.json --noEmit && tsc -p tsconfig.preload.json --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.backend.json --noEmit",
+    "clean": "node -e \"fs.rmSync('dist',{recursive:true,force:true})\"",
+    "build:frontend": "vite build",
+    "build:backend": "tsc -p tsconfig.backend.json",
+    "stage:native": "node scripts/stage-zero-native-assets.mjs",
     "latency:summary": "node scripts/latency-summary.mjs",
-    "latency:smoke": "electron scripts/webrtc-latency-smoke.cjs",
+    "benchmark:shells": "node scripts/benchmark-shells.mjs",
+    "smoke:backend": "npm run build && node scripts/backend-integration-smoke.mjs",
     "latency:phrase-preview": "node scripts/phrase-preview-check.mjs",
-    "latency:phrase-preview-audio": "electron scripts/phrase-preview-audio-check.cjs",
     "latency:go-router": "cd router-go && go test ./... && go run ./cmd/router-bench",
     "latency:go-realtime-smoke": "cd router-go && go run ./cmd/realtime-smoke",
-    "latency:ws-playback-smoke": "electron scripts/ws-audio-playback-smoke.cjs",
-    "build": "tsc -p tsconfig.node.json && tsc -p tsconfig.preload.json && node scripts/copy-preload-cjs.mjs && vite build",
-    "dist:mac": "npm run build && electron-builder --mac",
-    "dist:win": "npm run build && electron-builder --win",
-    "dist": "npm run build && electron-builder --mac --win"
+    "build": "npm run clean && npm run typecheck && npm run build:backend && npm run build:frontend && npm run stage:native",
+    "native:build": "npm run build && zig build -Doptimize=ReleaseSmall -Dtrace=off",
+    "native:build:debug": "npm run build && zig build",
+    "dist:mac": "npm run build && zig build package -Dpackage-target=macos -Doptimize=ReleaseSmall -Dtrace=off",
+    "dist:linux": "npm run build && zig build package -Dpackage-target=linux -Doptimize=ReleaseSmall -Dtrace=off",
+    "dist": "npm run dist:mac"
   },
   "dependencies": {
-    "@vitejs/plugin-react": "^5.1.1",
-    "dotenv": "^17.2.3",
-    "lucide-react": "^1.14.0",
+    "@vitejs/plugin-react": "^5.2.0",
+    "dotenv": "^17.4.2",
+    "lucide-react": "^1.16.0",
     "react": "^19.2.6",
     "react-dom": "^19.2.6",
-    "ws": "^8.18.3"
+    "ws": "^8.21.0",
+    "zero-native": "^0.1.9"
   },
   "devDependencies": {
-    "@types/node": "^25.0.1",
-    "@types/react": "^19.2.14",
+    "@types/node": "^25.9.1",
+    "@types/react": "^19.2.15",
     "@types/react-dom": "^19.2.3",
     "@types/ws": "^8.18.1",
     "concurrently": "^9.2.1",
-    "cross-env": "^10.1.0",
-    "electron": "^39.2.7",
-    "electron-builder": "^26.0.12",
     "typescript": "^5.9.3",
-    "vite": "^7.2.7",
-    "wait-on": "^9.0.3"
-  },
-  "build": {
-    "appId": "com.cotranslator.desktop",
-    "productName": "Co Translator",
-    "files": [
-      "dist/**",
-      "package.json"
-    ],
-    "directories": {
-      "output": "release"
-    },
-    "mac": {
-      "target": [
-        "dmg",
-        "zip"
-      ],
-      "category": "public.app-category.productivity",
-      "extendInfo": {
-        "NSMicrophoneUsageDescription": "Co Translator needs microphone access to stream speech for realtime translation."
-      },
-      "hardenedRuntime": true,
-      "entitlements": "build/entitlements.mac.plist",
-      "entitlementsInherit": "build/entitlements.mac.plist"
-    },
-    "win": {
-      "target": [
-        "nsis",
-        "zip"
-      ]
-    },
-    "nsis": {
-      "oneClick": false,
-      "allowToChangeInstallationDirectory": true
-    }
+    "vite": "^7.3.3",
+    "wait-on": "^9.0.10"
   }
 }
