@@ -1,4 +1,5 @@
-[English](./README.md) | [한국어](./README.ko.md) ![Version](https://img.shields.io/badge/version-0.0.1-333333?style=flat-square) [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-yellow.svg)](./LICENSE)
+[English](./README.md) | [한국어](./README.ko.md)
+![Version](https://img.shields.io/badge/version-0.0.1-333333?style=flat-square) [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-yellow.svg)](./LICENSE)
 
 # Co Translator
 
