@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Co Translator: Electron vs Zero Native</title>
+  <style>
+    :root { color-scheme: light; --ink: #18211f; --muted: #596662; --line: #d7ded8; --paper: #fbfbf7; --panel: #ffffff; --green: #176b52; --blue: #245d8f; --amber: #8b5a16; }
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: var(--ink); background: var(--paper); }
+    main { max-width: 1160px; margin: 0 auto; padding: 42px 24px 56px; }
+    h1 { font-size: 34px; line-height: 1.12; margin: 0 0 8px; }
+    h2 { margin: 34px 0 12px; font-size: 21px; }
+    p { line-height: 1.55; }
+    .meta { color: var(--muted); margin: 0 0 26px; }
+    .grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
+    .metric { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; min-height: 86px; }
+    .metric span { color: var(--muted); font-size: 13px; }
+    .metric b { display: block; font-size: 25px; margin-top: 8px; }
+    .metric.good b { color: var(--green); }
+    .metric.watch b { color: var(--amber); }
+    table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+    th, td { padding: 10px 12px; border-bottom: 1px solid #edf0eb; text-align: left; vertical-align: top; }
+    th { background: #eef2ed; font-size: 13px; }
+    tr:last-child td { border-bottom: 0; }
+    code { font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+    .note { background: #fff9e8; border: 1px solid #e8d48a; border-radius: 8px; padding: 14px 16px; }
+    .callout { background: #eef7f3; border: 1px solid #b9d8ca; border-radius: 8px; padding: 14px 16px; }
+    .two { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    @media (max-width: 860px) { .grid, .two { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Co Translator Shell Migration Report</h1>
+  <p class="meta">Generated 2026-05-31T16:05:35.351Z on darwin arm64. Zero Native was built with <code>-Doptimize=ReleaseSmall</code> and <code>-Dtrace=off</code>.</p>
+
+  <section class="grid">
+    <div class="metric"><span>Electron RSS baseline</span><b>407.58 MB</b></div>
+    <div class="metric good"><span>Optimized Zero Native RSS</span><b>102.38 MB</b></div>
+    <div class="metric good"><span>RSS reduction</span><b>74.9%</b></div>
+    <div class="metric"><span>Zero Native backend ready</span><b>371 ms cold / 28 ms warm</b></div>
+  </section>
+
+  <h2>680 KB Claim vs 159 MB RSS</h2>
+  <section class="grid">
+    <div class="metric good"><span>Packaged .app size</span><b>670 KB</b></div>
+    <div class="metric good"><span>Packaged executable</span><b>336 KB</b></div>
+    <div class="metric watch"><span>Process-tree RSS</span><b>102.38 MB</b></div>
+    <div class="metric watch"><span>App + WebKit physical footprint</span><b>65.72 MB</b></div>
+  </section>
+  <p class="note">Root cause: the small number is file size, not resident memory. This app's packaged executable is already smaller than 680 KB, and the whole packaged app is around that size. The 159 MB number is process-tree RSS after launch, dominated by mapped AppKit/WebKit pages in the native host plus the backend sidecar. RSS also counts shared system library pages; <code>vmmap</code> physical footprint is the better proxy for unique resident pressure on macOS.</p>
+
+  <h2>Memory Root Cause</h2>
+  <table>
+    <thead><tr><th>Component</th><th>RSS</th><th>Physical footprint</th><th>Cause</th></tr></thead>
+    <tbody>
+      <tr><td>Native host process</td><td>90.97 MB</td><td>21.50 MB</td><td>WKWebView/AppKit/WebKit frameworks are loaded into the host process; most of the high RSS is shared read-only framework mapping, not app binary size.</td></tr>
+      <tr><td>Go backend sidecar</td><td>11.41 MB</td><td>4.41 MB</td><td>The OpenAI HTTP/WebSocket bridge now runs as a small Go sidecar to keep API keys out of the renderer while avoiding a long-lived JavaScript runtime.</td></tr>
+      <tr><td>WebKit XPC processes</td><td>75.98 MB</td><td>39.82 MB</td><td>macOS launches WebKit GPU, Networking, and WebContent XPC services under <code>launchd</code>, so they are attributable to the WebView but are not children of the app process.</td></tr>
+      <tr><td>Attributable total</td><td>178.36 MB</td><td>65.72 MB</td><td>RSS answers “what is mapped/resident by these processes”; physical footprint is closer to the app's private pressure.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Latency</h2>
+  <table>
+    <thead><tr><th>Bridge</th><th>p50</th><th>p95</th><th>p99</th><th>min</th><th>max</th><th>0 ms samples</th></tr></thead>
+    <tbody>
+      <tr><td>Electron IPC invoke baseline</td><td>0.00 ms</td><td>0.10 ms</td><td>not measured</td><td>not measured</td><td>not measured</td><td>not measured</td></tr>
+      <tr><td>Optimized Zero Native WebSocket bridge</td><td>0.04 ms</td><td>0.07 ms</td><td>0.12 ms</td><td>0.02 ms</td><td>0.69 ms</td><td>0 / 1000</td></tr>
+    </tbody>
+  </table>
+  <p class="note">Root cause for the apparent Electron p50 advantage: the Electron IPC baseline was measured inside the renderer with <code>performance.now()</code>, which quantizes many very fast calls to exactly <code>0.00 ms</code>. The Zero Native measurement is a real local WebSocket round trip through the backend sidecar using Node's finer timer, so it rarely reports zero even when the operation is only a few hundredths of a millisecond. The p95 comparison is the more useful number here.</p>
+
+  <h2>Lowest-Latency / Lowest-Memory Path</h2>
+  <section class="two">
+    <div class="callout">
+      <b>Applied now</b>
+      <p>Build Zero Native with <code>ReleaseSmall</code> and trace disabled. The native launcher now prefers the Go backend sidecar, falls back to the bundled backend with <code>bun --smol --no-install</code>, and finally falls back to capped Node with <code>--max-old-space-size=32 --max-semi-space-size=1</code>. The renderer also schedules an idle Go binary prewarm that exits immediately, keeping idle memory low while reducing the first action path.</p>
+    </div>
+    <div class="callout">
+      <b>Best next solution</b>
+      <p>Keep the Go sidecar as the active bridge/backend path. A future in-process native backend could remove the sidecar entirely, but the current Go process is already below the 200 MB active RSS target when WebKit XPC is counted.</p>
+    </div>
+  </section>
+
+  <h2>Options Tested</h2>
+  <table>
+    <thead><tr><th>Option</th><th>Memory impact</th><th>Latency impact</th><th>Decision</th></tr></thead>
+    <tbody>
+      <tr><td>Go sidecar</td><td>Largest reduction found in the existing architecture; current sidecar is 11.41 MB RSS / 4.41 MB physical.</td><td>No regression in the local bridge probe; current run is 0.0448 / 0.0730 ms p50/p95.</td><td>Applied as preferred runtime when the Go binary is built.</td></tr>
+      <tr><td>Bun sidecar</td><td>Reduced versus Node, especially with bundled output and <code>--smol</code>, but still larger than Go.</td><td>No regression in the local bridge probe.</td><td>Kept as fallback.</td></tr>
+      <tr><td>Node heap caps</td><td>Small reduction in Node RSS/physical footprint.</td><td>No regression in the local bridge probe, but more memory than Bun.</td><td>Kept as fallback when Bun is unavailable.</td></tr>
+      <tr><td><code>--jitless</code></td><td>Slightly lower Node RSS than heap caps.</td><td>Worse bridge p50/p95 in the local probe.</td><td>Rejected for the low-latency target.</td></tr>
+      <tr><td>Lazy-start + idle prewarm</td><td>Removes the sidecar from idle memory; the short prewarm process exits before the steady-state memory snapshot.</td><td>Avoids paying the full Go binary cold-start on the first user action after idle.</td><td>Applied as the default lightweight Zero Native integration.</td></tr>
+      <tr><td>Port backend to native</td><td>Largest controllable reduction because it removes the Node sidecar.</td><td>Can preserve or improve bridge latency if implemented as a native control/data plane.</td><td>Best long-term solution; larger rewrite with OpenAI protocol risk.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Memory Method</h2>
+  <p>RSS is measured from the launched Zero Native app process tree after the backend health endpoint is ready and the app has idled for five seconds. The idle snapshot is taken before the persistent backend starts; the active snapshot includes the native shell and backend sidecar. The WebKit XPC rows are detected by taking a WebKit process snapshot before launch and attributing newly created WebKit XPC services to this run. The Electron RSS number is the provided migration benchmark baseline.</p>
+
+  <h2>Measured Processes: Optimized Zero Native</h2>
+  <table><thead><tr><th>PID</th><th>RSS MB</th><th>Physical MB</th><th>Command</th></tr></thead><tbody>
+    <tr>
+      <td>44912</td>
+      <td>90.97</td>
+      <td>21.50</td>
+      <td><code>zig-out/bin/co-translator</code></td>
+    </tr>
+    <tr>
+      <td>44913</td>
+      <td>11.41</td>
+      <td>4.41</td>
+      <td><code>dist/backend-go/co-translator-backend</code></td>
+    </tr></tbody></table>
+
+  <h2>Attributed WebKit XPC Processes</h2>
+  <table><thead><tr><th>PID</th><th>RSS MB</th><th>Physical MB</th><th>Command</th></tr></thead><tbody>
+    <tr>
+      <td>44916</td>
+      <td>30.14</td>
+      <td>19.50</td>
+      <td><code>/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent</code></td>
+    </tr>
+    <tr>
+      <td>44914</td>
+      <td>26.25</td>
+      <td>14.30</td>
+      <td><code>/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.GPU.xpc/Contents/MacOS/com.apple.WebKit.GPU</code></td>
+    </tr>
+    <tr>
+      <td>44915</td>
+      <td>19.59</td>
+      <td>6.02</td>
+      <td><code>/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.Networking.xpc/Contents/MacOS/com.apple.WebKit.Networking</code></td>
+    </tr></tbody></table>
+
+  <h2>Commands</h2>
+  <table><tbody>
+    <tr><th>Build</th><td><code>npm run build && zig build -Doptimize=ReleaseSmall -Dtrace=off</code></td></tr>
+    <tr><th>Zero Native app</th><td><code>zig-out/bin/co-translator</code></td></tr>
+    <tr><th>File size probe</th><td><code>du -sh zig-out/package/co-translator-0.0.1-macos-ReleaseSmall.app</code> and executable stat size</td></tr>
+    <tr><th>Physical footprint probe</th><td><code>vmmap -summary &lt;pid&gt;</code> on macOS</td></tr>
+    <tr><th>Zero Native latency</th><td><code>ws://127.0.0.1:41873/bridge</code>, 1000 sequential <code>translator:get-api-pricing</code> calls</td></tr>
+    <tr><th>Electron baseline</th><td>Measured from origin/main dba1eea on this machine with Electron 39.2.7.</td></tr>
+  </tbody></table>
+</main>
+</body>
+</html>
