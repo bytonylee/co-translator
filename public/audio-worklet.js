@@ -2,7 +2,7 @@ class Pcm16Downsampler extends AudioWorkletProcessor {
   constructor(options) {
     super();
     this.targetSampleRate = options.processorOptions.targetSampleRate || 24000;
-    this.chunkSamples = Math.max(120, Math.floor((this.targetSampleRate * (options.processorOptions.chunkMs || 20)) / 1000));
+    this.chunkSamples = Math.max(48, Math.floor((this.targetSampleRate * (options.processorOptions.chunkMs || 20)) / 1000));
     this.inputSampleRate = sampleRate;
     this.ratio = this.inputSampleRate / this.targetSampleRate;
     this.pending = [];
