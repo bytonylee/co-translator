@@ -265,11 +265,11 @@ p {
 }
 
 .error {
-  border: 1px solid var(--fg);
-  background: var(--bg);
-  color: var(--fg);
-  padding: 12px 14px;
+  color: var(--status-error-bg);
+  padding: 0;
   font-weight: 720;
+  font-size: 13px;
+  line-height: 1.35;
 }
 
 .textGrid {
@@ -829,16 +829,56 @@ select:disabled {
 }
 
 .toggleRow {
+  display: grid;
   grid-template-columns: 1fr auto;
+  gap: 8px;
   align-items: center;
   border-top: 1px solid var(--fg-14);
+  color: var(--fg-62);
+  font-size: 13px;
+  font-weight: 720;
   padding-top: 14px;
 }
 
-.toggleRow input {
+.toggleRow > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.toggleSwitch {
   width: 42px;
   height: 24px;
-  accent-color: var(--fg);
+  border: 1px solid var(--fg);
+  border-radius: 999px;
+  background: var(--bg);
+  color: var(--fg);
+  padding: 2px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-start;
+}
+
+.toggleSwitch span {
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  background: currentColor;
+  transition: transform 0.16s ease, background 0.16s ease;
+}
+
+.toggleSwitch[aria-pressed="true"] {
+  background: var(--fg);
+  color: var(--bg);
+}
+
+.toggleSwitch[aria-pressed="true"] span {
+  transform: translateX(18px);
+}
+
+.toggleSwitch:focus {
+  outline: 2px solid var(--fg);
+  outline-offset: 2px;
 }
 
 @keyframes buttonVibrate {
