@@ -1,6 +1,8 @@
 node_modules/
 dist/
 release/
+.zig-cache/
+zig-out/
 .cache/
 .codex/
 .claude/
