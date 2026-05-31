@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, type SetStateAction } from "react";
 import { ArrowDown, Captions, CircleAlert, Download, ExternalLink, KeyRound, Mic2, Moon, Play, Settings2, ShieldCheck, Square, Sun, X } from "lucide-react";
-import { createAudioStreamer, type AudioStreamer } from "./audio";
+import { createAudioInputStream, createAudioStreamer, createAudioStreamerFromStream, type AudioStreamer } from "./audio";
 import { translateKnownPhrase } from "./phrasePreview";
 import { createSpeechPreview, type SpeechPreview } from "./speechPreview";
 import { createWebRtcTranslator, getWebRtcSourceStream, type WebRtcTranslator } from "./webrtc";
@@ -66,6 +66,14 @@ type MeetingRecordingSession = {
   startedAtMs: number;
 };
 
+type CompletedRecording = {
+  blob: Blob;
+  sourceLanguage: string;
+  startedAtMs: number;
+  endedAtMs: number;
+  diarized: boolean;
+};
+
 const themeStorageKey = "co-translator-theme";
 const terminalPunctuationPattern = /[.!?。？！)]$/;
 
@@ -101,6 +109,7 @@ export default function App() {
   const [apiKeyMessage, setApiKeyMessage] = useState("");
   const [apiKeySaving, setApiKeySaving] = useState(false);
   const [apiPricing, setApiPricing] = useState<ApiPricing>(defaultApiPricing);
+  const [transcribeUserVoice, setTranscribeUserVoice] = useState(true);
   const [accumulatedCostUsage, setAccumulatedCostUsage] = useState<CostUsage>(emptyCostUsage);
   const [activeCostSession, setActiveCostSession] = useState<ActiveCostSession | null>(null);
   const [activeMeetingDiarizeSession, setActiveMeetingDiarizeSession] = useState<ActiveMeetingDiarizeSession | null>(null);
@@ -110,7 +119,6 @@ export default function App() {
   const [meetingSegments, setMeetingSegments] = useState<MeetingTranscriptSegment[]>([]);
   const [meetingLiveSourceText, setMeetingLiveSourceText] = useState("");
   const [meetingLiveTargetText, setMeetingLiveTargetText] = useState("");
-  const [meetingTranslationText, setMeetingTranslationText] = useState("");
   const [meetingProcessing, setMeetingProcessing] = useState(false);
   const [meetingTargetMenuOpen, setMeetingTargetMenuOpen] = useState(false);
   const [stopPhase, setStopPhase] = useState<StopPhase>("idle");
@@ -125,6 +133,7 @@ export default function App() {
   const sourceEditorRef = useRef<HTMLTextAreaElement | null>(null);
   const targetEditorRef = useRef<HTMLTextAreaElement | null>(null);
   const meetingChatRef = useRef<HTMLDivElement | null>(null);
+  const completedRecordingsRef = useRef<CompletedRecording[]>([]);
   const meetingLiveSourceTextRef = useRef("");
   const meetingLiveTargetTextRef = useRef("");
   const sourceFollowBottomRef = useRef(true);
@@ -170,18 +179,14 @@ export default function App() {
   const allUsageLabel = `${translateUsageLabel} · ${sourceUsageLabel} · ${meetingUsageLabel}`;
   const activeSourceLanguage = isMeetingMode ? meetingSourceLanguage : sourceLanguage;
   const groupedMeetingSegments = mergeConsecutiveSpeakerSegments(meetingSegments);
-  const liveMeetingDisplayText = (running || stopping) ? saveableText(meetingLiveTargetText, targetPlaceholder) : "";
-  const meetingDisplayTranslationText = appendDisplayTextIfMissing(meetingTranslationText, liveMeetingDisplayText);
-  const hasLiveMeetingDisplay = Boolean(liveMeetingDisplayText);
+  const meetingDisplayTranslationText = running ? saveableText(meetingLiveTargetText, targetPlaceholder) : "";
   const hasDiarizedMeetingDisplay = groupedMeetingSegments.length > 0;
   const hasTranslatedMeetingDisplay = Boolean(meetingDisplayTranslationText);
   const hasMeetingDisplay = hasDiarizedMeetingDisplay || hasTranslatedMeetingDisplay;
-  const meetingExportTranslationText = appendDisplayTextIfMissing(meetingTranslationText, saveableText(meetingLiveTargetText, targetPlaceholder));
+  const meetingExportTranslationText = meetingDisplayTranslationText;
 
   useEffect(() => {
     void refreshDevices();
-    void refreshApiKeyStatus();
-    void refreshApiPricing();
     if (!window.translator) {
       setStatus("Presentation mode · Preview");
       return;
@@ -204,7 +209,10 @@ export default function App() {
   useEffect(() => {
     if (!apiKeyOpen) {
       setApiKeyInput("");
+      return;
     }
+    void refreshApiKeyStatus();
+    void refreshApiPricing();
   }, [apiKeyOpen]);
 
   useEffect(() => {
@@ -244,20 +252,6 @@ export default function App() {
     const timer = window.setInterval(() => setCostTickMs(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, [activeCostSession, activeMeetingDiarizeSession]);
-
-  useEffect(() => {
-    if (!window.translator || running || isMeetingMode) {
-      return;
-    }
-
-    const warmTimer = window.setTimeout(() => {
-      void window.translator.warmSession({ sourceLanguage: activeSourceLanguage, targetLanguage, latencyMode, transcribeUserVoice: true }).catch((warmError: unknown) => {
-        setError(warmError instanceof Error ? warmError.message : "Could not warm Realtime socket.");
-      });
-    }, 500);
-
-    return () => window.clearTimeout(warmTimer);
-  }, [activeSourceLanguage, targetLanguage, latencyMode, running, isMeetingMode]);
 
   useLayoutEffect(() => {
     followBottomIfNeeded(sourceEditorRef.current, sourceFollowBottomRef);
@@ -329,7 +323,7 @@ export default function App() {
   async function applyApiKey() {
     if (!window.translator) {
       setApiKeyError(true);
-      setApiKeyMessage("Open the Electron app to store an API key.");
+      setApiKeyMessage("Start the native backend to store an API key.");
       return;
     }
     const trimmedApiKey = apiKeyInput.trim();
@@ -385,7 +379,7 @@ export default function App() {
       setStatus("Listening");
       if (shouldDisplaySourceTranscript() && !apiSourceTextSeenRef.current) {
         setSourceProvisional(true);
-      setSessionSourceText((current) => {
+        setSessionSourceText((current) => {
           if (current) {
             return current;
           }
@@ -435,6 +429,15 @@ export default function App() {
         meetingTargetFinalRef.current = event.final;
         meetingTargetUpdatedAtRef.current = Date.now();
       }
+      if (shouldDisplaySourceTranscript() && !apiSourceTextSeenRef.current) {
+        setSourceProvisional(true);
+        setSessionSourceText((current) => {
+          if (saveableText(current, sourcePlaceholder)) {
+            return current;
+          }
+          return mergeSessionText(sourceSessionBaseRef.current, sourcePlaceholder);
+        });
+      }
       setTargetProvisional(false);
       setStatus(event.final ? "Translated" : "Translating");
       if (firstApiTargetText) {
@@ -475,15 +478,13 @@ export default function App() {
     speculativeTargetLoggedRef.current = false;
     firstSpeechAtRef.current = null;
     if (!window.translator) {
-      setError("Open the Electron app to connect to OpenAI Realtime.");
+      setError("Start the native backend to connect to OpenAI Realtime.");
       return;
     }
     setState("connecting");
     setStatus("Connecting");
     let pendingFastSourceStream: MediaStream | undefined;
     try {
-      meetingRecordingRef.current = await createMeetingRecording(deviceId, true);
-      meetingRecordingRef.current.recorder.start(1000);
       if (latencyMode === "webrtc") {
         setStatus("Connecting WebRTC translation");
         speechPreviewRef.current = createSpeechPreview(activeSourceLanguage, latencyMode, handleSourcePreview, targetLanguage);
@@ -494,15 +495,21 @@ export default function App() {
           });
           return sourceStream;
         });
-        const translationCallPromise = window.translator.startTranslationCall({ sourceLanguage: activeSourceLanguage, targetLanguage, latencyMode, transcribeUserVoice: true });
+        const translationCallPromise = window.translator.startTranslationCall({ sourceLanguage: activeSourceLanguage, targetLanguage, latencyMode, transcribeUserVoice });
         const [{ clientSecret }, sourceStream] = await Promise.all([translationCallPromise, sourceStreamPromise]);
         pendingFastSourceStream = sourceStream;
+        meetingRecordingRef.current = createMeetingRecordingFromStream(sourceStream.clone(), true);
+        meetingRecordingRef.current.recorder.start(1000);
+        streamerRef.current = await createAudioStreamerFromStream(sourceStream, latencyMode, (audio) => {
+          recordRealtimeAudioUsage(audio.chunkMs);
+          window.translator.sendAudio(audio);
+        });
         webRtcTranslatorRef.current = await createWebRtcTranslator({
           clientSecret,
           deviceId,
           sourceStream,
           onConnected() {
-            beginCostSession("wallClock", true);
+            beginCostSession("wallClock", transcribeUserVoice);
             setState("connected");
             setStatus("Live WebRTC translation");
           },
@@ -529,12 +536,17 @@ export default function App() {
         return;
       }
 
-      await window.translator.startSession({ sourceLanguage: activeSourceLanguage, targetLanguage, latencyMode, transcribeUserVoice: true });
-      beginCostSession("audio", true);
-      streamerRef.current = await createAudioStreamer(deviceId, latencyMode, (audio) => {
+      const config = { sourceLanguage: activeSourceLanguage, targetLanguage, latencyMode, transcribeUserVoice };
+      const startSessionPromise = window.translator.startSession(config);
+      beginCostSession("audio", transcribeUserVoice);
+      const sourceStream = await createAudioInputStream(deviceId, latencyMode);
+      meetingRecordingRef.current = createMeetingRecordingFromStream(sourceStream.clone(), true);
+      meetingRecordingRef.current.recorder.start(1000);
+      streamerRef.current = await createAudioStreamerFromStream(sourceStream, latencyMode, (audio) => {
         recordRealtimeAudioUsage(audio.chunkMs);
         window.translator.sendAudio(audio);
-      });
+      }, true);
+      await startSessionPromise;
       if (latencyMode === "fast" && fastestPrimeMs > 0) {
         setStatus("Priming fastest audio");
         logUi("ui_fastest_prime_started", {
@@ -550,6 +562,10 @@ export default function App() {
       }
       speechPreviewRef.current = createSpeechPreview(activeSourceLanguage, latencyMode, handleSourcePreview, targetLanguage);
     } catch (startError) {
+      await streamerRef.current?.stop();
+      streamerRef.current = null;
+      await webRtcTranslatorRef.current?.stop();
+      webRtcTranslatorRef.current = null;
       pendingFastSourceStream?.getTracks().forEach((track) => track.stop());
       await window.translator.stopSession();
       const recording = meetingRecordingRef.current;
@@ -587,7 +603,7 @@ export default function App() {
       finishCostSession();
       const recording = meetingRecordingRef.current;
       meetingRecordingRef.current = null;
-      await stopRecordingWithoutDiarize(recording);
+      await archiveRecordingForDiarization(recording, sourceLanguage);
       await window.translator?.stopSession();
       await nextPaint();
     } finally {
@@ -604,6 +620,8 @@ export default function App() {
     setError("");
     setMeetingLiveSourceText("");
     setMeetingLiveTargetText("");
+    meetingLiveSourceTextRef.current = "";
+    meetingLiveTargetTextRef.current = "";
     sourceSessionBaseRef.current = "";
     targetSessionBaseRef.current = "";
     setSourceProvisional(false);
@@ -615,14 +633,14 @@ export default function App() {
     meetingTargetUpdatedAtRef.current = 0;
     firstSpeechAtRef.current = null;
     if (!window.translator) {
-      setError("Open the Electron app to diarize meeting audio.");
+      setError("Start the native backend to diarize meeting audio.");
       return;
     }
     try {
       setState("connecting");
       setStatus("Starting live meeting");
-      await window.translator.startSession({ sourceLanguage: meetingSourceLanguage, targetLanguage, latencyMode, transcribeUserVoice: true });
-      beginCostSession("audio", true);
+      await window.translator.startSession({ sourceLanguage: meetingSourceLanguage, targetLanguage, latencyMode, transcribeUserVoice });
+      beginCostSession("audio", transcribeUserVoice);
       meetingRecordingRef.current = await createMeetingRecording(deviceId, true);
       beginMeetingDiarizeSession(meetingRecordingRef.current.startedAtMs);
       meetingRecordingRef.current.recorder.start(1000);
@@ -698,18 +716,15 @@ export default function App() {
       const result = await window.translator.transcribeMeetingAudio({
         base64Audio: await blobToBase64(audio),
         mimeType: audio.type || meetingAudioMimeType(),
-        sourceLanguage: meetingSourceLanguage
+        sourceLanguage: meetingSourceLanguage,
+        targetLanguage
       });
       addMeetingDiarizeUsage(recordingMs);
-      const completedLiveTargetText = saveableText(meetingLiveTargetTextRef.current, targetPlaceholder);
       const nextSegments = mergeConsecutiveSpeakerSegments([...meetingSegments, ...result.segments]);
       setMeetingSegments(nextSegments);
-      if (completedLiveTargetText) {
-        setMeetingTranslationText((current) => appendDisplayTextIfMissing(current, completedLiveTargetText));
-        setTargetText((current) => appendDisplayTextIfMissing(current, completedLiveTargetText));
-      }
       setMeetingLiveSourceText("");
       setMeetingLiveTargetText("");
+      meetingLiveTargetTextRef.current = "";
       setStatus(`Meeting mode · ${speakerCount(nextSegments)} speakers`);
     } catch (stopError) {
       setError(stopError instanceof Error ? stopError.message : "Could not split meeting speakers.");
@@ -813,6 +828,58 @@ export default function App() {
     await waitForMeetingAudioSaves(recording);
   }
 
+  async function archiveRecordingForDiarization(recording: MeetingRecordingSession | null, recordingSourceLanguage: string) {
+    if (!recording) {
+      return;
+    }
+    if (recording.recorder.state !== "inactive") {
+      recording.recorder.stop();
+    }
+    recording.stream.getTracks().forEach((track) => track.stop());
+    const blob = await recording.stopped.catch(() => null);
+    await waitForMeetingAudioSaves(recording);
+    if (!blob?.size) {
+      return;
+    }
+    completedRecordingsRef.current.push({
+      blob,
+      sourceLanguage: recordingSourceLanguage,
+      startedAtMs: recording.startedAtMs,
+      endedAtMs: Date.now(),
+      diarized: false
+    });
+  }
+
+  async function diarizePendingRecordings(reason: string) {
+    const pending = completedRecordingsRef.current.filter((recording) => !recording.diarized);
+    if (!pending.length) {
+      return;
+    }
+    if (!window.translator) {
+      setError("Start the native backend to split saved conversation audio.");
+      return;
+    }
+
+    setMeetingProcessing(true);
+    setStatus(reason === "mode_switch" ? "Splitting saved conversation" : "Splitting speakers");
+    try {
+      for (const recording of pending) {
+        const result = await window.translator.transcribeMeetingAudio({
+          base64Audio: await blobToBase64(recording.blob),
+          mimeType: recording.blob.type || meetingAudioMimeType(),
+          sourceLanguage: recording.sourceLanguage,
+          targetLanguage
+        });
+        recording.diarized = true;
+        setMeetingSegments((current) => mergeConsecutiveSpeakerSegments([...current, ...result.segments]));
+        addMeetingDiarizeUsage(Math.max(0, recording.endedAtMs - recording.startedAtMs));
+      }
+    } finally {
+      setMeetingProcessing(false);
+      setStatus("Meeting mode");
+    }
+  }
+
   function clearFastestPrimeTimer() {
     if (fastestPrimeTimerRef.current !== null) {
       window.clearTimeout(fastestPrimeTimerRef.current);
@@ -879,7 +946,7 @@ export default function App() {
   }
 
   function shouldDisplaySourceTranscript() {
-    return true;
+    return transcribeUserVoice;
   }
 
   function showSpeculativeTarget(text: string) {
@@ -951,10 +1018,9 @@ export default function App() {
     setError("");
     if (running) {
       if (shouldDiarizePresentation) {
-        const currentLiveTargetText = saveableText(targetText, targetPlaceholder);
         targetSessionBaseRef.current = "";
-        meetingLiveTargetTextRef.current = currentLiveTargetText;
-        setMeetingLiveTargetText(currentLiveTargetText);
+        meetingLiveTargetTextRef.current = "";
+        setMeetingLiveTargetText("");
         setAppMode("meeting");
         appModeRef.current = "meeting";
         await stopMeeting();
@@ -962,12 +1028,14 @@ export default function App() {
         await stop();
       }
     } else if (currentMode === "presentation" && nextMode === "meeting") {
-      const currentTargetText = saveableText(targetText, targetPlaceholder);
-      if (currentTargetText) {
-        setMeetingTranslationText((current) => appendDisplayTextIfMissing(current, currentTargetText));
-      }
+      setAppMode("meeting");
+      appModeRef.current = "meeting";
+      await diarizePendingRecordings("mode_switch");
+      setStatus("Meeting mode");
+      return;
     }
     setAppMode(nextMode);
+    appModeRef.current = nextMode;
     if (!shouldDiarizePresentation) {
       setStatus(nextMode === "presentation" ? "Presentation mode" : "Meeting mode");
     }
@@ -1070,13 +1138,21 @@ export default function App() {
                   <option value="stable">Stable network</option>
                 </select>
               </label>
-              <label className="toggleRow">
-                <span>
+              <div className="toggleRow">
+                <span id="transcribe-user-voice-label">
                   <Captions size={16} />
                   GPT-Realtime-Whisper user transcript
                 </span>
-                <input type="checkbox" checked readOnly disabled />
-              </label>
+                <button
+                  type="button"
+                  className="toggleSwitch"
+                  aria-pressed={transcribeUserVoice}
+                  aria-labelledby="transcribe-user-voice-label"
+                  onClick={() => setTranscribeUserVoice((enabled) => !enabled)}
+                >
+                  <span aria-hidden="true" />
+                </button>
+              </div>
             </div>
           </div>
         ) : null}
@@ -1459,6 +1535,13 @@ async function createMeetingRecording(deviceId: string, persistLocalAudio = fals
       autoGainControl: true
     }
   });
+  return createMeetingRecordingFromStream(stream, persistLocalAudio);
+}
+
+function createMeetingRecordingFromStream(stream: MediaStream, persistLocalAudio = false): MeetingRecordingSession {
+  if (typeof MediaRecorder === "undefined") {
+    throw new Error("Meeting recording is not supported in this browser runtime.");
+  }
   const chunks: Blob[] = [];
   const pendingSaves: Promise<void>[] = [];
   const localSessionId = localMeetingAudioSessionId();
