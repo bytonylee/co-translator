@@ -10,6 +10,7 @@ const releaseAppPath = path.join(rootDir, "zig-out/package/co-translator-0.0.1-m
 const releaseBinaryPath = path.join(releaseAppPath, "Contents/MacOS/co-translator");
 const builtBinaryPath = path.join(rootDir, "zig-out/bin/co-translator");
 const bridgePort = 41873;
+const bridgeToken = "benchmark-bridge-token";
 const iterations = Number(process.env.BENCH_ITERATIONS || 5000);
 const zeroNativeOptimize = process.env.ZERO_NATIVE_OPTIMIZE || "ReleaseSmall";
 const zeroNativeTrace = process.env.ZERO_NATIVE_TRACE || "off";
@@ -76,6 +77,7 @@ function startApp(env = {}) {
       ...process.env,
       ...env,
       CO_TRANSLATOR_BRIDGE_PORT: String(bridgePort),
+      CO_TRANSLATOR_BRIDGE_TOKEN: bridgeToken,
       ZERO_NATIVE_LOG_DIR: path.join(rootDir, ".zig-cache", "benchmark-logs")
     },
     stdio: ["ignore", "ignore", "ignore"]
@@ -285,7 +287,7 @@ async function measureZeroNativeIdle() {
 }
 
 async function measureBridgeLatency() {
-  const socket = new WebSocket(`ws://127.0.0.1:${bridgePort}/bridge`);
+  const socket = new WebSocket(`ws://127.0.0.1:${bridgePort}/bridge?token=${encodeURIComponent(bridgeToken)}`);
   await new Promise((resolve, reject) => {
     socket.once("open", resolve);
     socket.once("error", reject);
