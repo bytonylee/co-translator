@@ -2,7 +2,10 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
+	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,9 +25,21 @@ import (
 )
 
 const (
-	apiKeyPageURL   = "https://platform.openai.com/settings/organization/api-keys"
-	bridgePath      = "/bridge"
-	apiKeyStoreFile = "openai-api-key.json"
+	apiKeyPageURL                    = "https://platform.openai.com/settings/organization/api-keys"
+	bridgePath                       = "/bridge"
+	apiKeyStoreFile                  = "openai-api-key.json"
+	maxAPIKeyLength                  = 4096
+	maxAudioBase64Length             = 64 * 1024
+	maxMeetingAudioChunkBase64Length = 6 * 1024 * 1024
+	maxMeetingAudioBase64Length      = 36 * 1024 * 1024
+	maxBridgeMessageBytes            = 40 * 1024 * 1024
+	allowOpenAIBaseURLOverrideFlag   = "CO_TRANSLATOR_ALLOW_OPENAI_BASE_URL_OVERRIDE"
+)
+
+var (
+	bridgeTokenValue string
+	runtimeAPIKeyMu  sync.Mutex
+	runtimeAPIKey    string
 )
 
 type bridgeRequest struct {
@@ -124,12 +139,46 @@ func main() {
 	}
 }
 
+func bridgeRequestAuthorized(r *http.Request) bool {
+	token := r.URL.Query().Get("token")
+	if subtle.ConstantTimeCompare([]byte(token), []byte(bridgeToken())) != 1 {
+		return false
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	switch origin {
+	case "zero://app", "zero://inline", "file://local", "file://", "http://127.0.0.1:5173", "http://localhost:5173":
+		return true
+	default:
+		return false
+	}
+}
+
+func bridgeToken() string {
+	if bridgeTokenValue != "" {
+		return bridgeTokenValue
+	}
+	if token := strings.TrimSpace(os.Getenv("CO_TRANSLATOR_BRIDGE_TOKEN")); token != "" {
+		bridgeTokenValue = token
+		return bridgeTokenValue
+	}
+	var raw [32]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		panic(err)
+	}
+	bridgeTokenValue = hex.EncodeToString(raw[:])
+	return bridgeTokenValue
+}
+
 func (s *server) handleBridge(w http.ResponseWriter, r *http.Request) {
-	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	upgrader := websocket.Upgrader{CheckOrigin: bridgeRequestAuthorized}
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
+	conn.SetReadLimit(maxBridgeMessageBytes)
 	s.mu.Lock()
 	s.clients[conn] = true
 	s.mu.Unlock()
@@ -193,6 +242,9 @@ func (s *server) runCommand(command string, payload json.RawMessage) (interface{
 		if err := json.Unmarshal(payload, &chunk); err != nil {
 			return nil, err
 		}
+		if err := validateAudioChunk(chunk); err != nil {
+			return nil, err
+		}
 		s.receiveAudio(chunk)
 		return nil, nil
 	case "translator:stop":
@@ -202,10 +254,16 @@ func (s *server) runCommand(command string, payload json.RawMessage) (interface{
 		if err := json.Unmarshal(payload, &req); err != nil {
 			return nil, err
 		}
+		if err := validateMeetingRequest(req); err != nil {
+			return nil, err
+		}
 		return s.transcribeMeeting(req)
 	case "translator:save-meeting-audio-chunk":
 		var req saveChunkRequest
 		if err := json.Unmarshal(payload, &req); err != nil {
+			return nil, err
+		}
+		if err := validateSaveChunkRequest(req); err != nil {
 			return nil, err
 		}
 		return nil, saveMeetingAudioChunk(req)
@@ -244,29 +302,34 @@ func parseConfig(payload []byte) (config, error) {
 }
 
 func (s *server) apiKeyStatus() map[string]interface{} {
-	if os.Getenv("OPENAI_API_KEY") != "" {
+	if currentRuntimeAPIKey() != "" {
+		return map[string]interface{}{"configured": true, "storage": "local"}
+	}
+	if v := os.Getenv("OPENAI_API_KEY"); v != "" {
+		if _, err := validateAPIKey(v); err != nil {
+			return map[string]interface{}{"configured": false, "storage": "none"}
+		}
 		return map[string]interface{}{"configured": true, "storage": "environment"}
 	}
-	stored, _ := os.ReadFile(apiKeyStorePath())
-	if len(stored) > 0 {
+	if readStoredAPIKey() != "" {
 		return map[string]interface{}{"configured": true, "storage": "local"}
 	}
 	return map[string]interface{}{"configured": false, "storage": "none"}
 }
 
 func (s *server) setAPIKey(key string) (map[string]interface{}, error) {
-	key = strings.TrimSpace(key)
-	if key == "" {
-		return nil, errors.New("API key is required")
+	key, err := validateAPIKey(key)
+	if err != nil {
+		return nil, err
 	}
 	if err := os.MkdirAll(userDataDir(), 0700); err != nil {
 		return nil, err
 	}
-	data, _ := json.MarshalIndent(map[string]string{"encoding": "local", "value": key}, "", "  ")
+	data, _ := json.MarshalIndent(map[string]string{"encoding": "plaintext-v1", "value": key}, "", "  ")
 	if err := os.WriteFile(apiKeyStorePath(), data, 0600); err != nil {
 		return nil, err
 	}
-	_ = os.Setenv("OPENAI_API_KEY", key)
+	setRuntimeAPIKey(key)
 	return map[string]interface{}{"configured": true, "storage": "local"}, nil
 }
 
@@ -327,7 +390,11 @@ func shouldTranscribe(cfg config) bool {
 func (s *server) translationClientSecret(cfg config) (string, error) {
 	body := map[string]interface{}{"session": map[string]interface{}{"model": getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-translate"), "audio": map[string]interface{}{"output": map[string]string{"language": languageCode(cfg.TargetLanguage)}}}}
 	encoded, _ := json.Marshal(body)
-	req, err := http.NewRequest("POST", apiBase()+"/v1/realtime/translations/client_secrets", bytes.NewReader(encoded))
+	base, err := apiBase()
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequest("POST", base+"/v1/realtime/translations/client_secrets", bytes.NewReader(encoded))
 	if err != nil {
 		return "", err
 	}
@@ -363,7 +430,11 @@ func (s *server) connectRealtime(cfg config) error {
 	}
 	sockets := make([]*websocket.Conn, 0, count)
 	for lane := 0; lane < count; lane++ {
-		u := realtimeBase() + "/v1/realtime/translations?model=" + url.QueryEscape(getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-translate"))
+		base, err := realtimeBase()
+		if err != nil {
+			return err
+		}
+		u := base + "/v1/realtime/translations?model=" + url.QueryEscape(getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-translate"))
 		conn, _, err := websocket.DefaultDialer.Dial(u, http.Header{"Authorization": {"Bearer " + apiKey()}, "OpenAI-Safety-Identifier": {"co-translator-local-desktop"}})
 		if err != nil {
 			s.closeRealtime()
@@ -431,7 +502,11 @@ func (s *server) ensureTranscription(cfg config, warm bool) error {
 		return nil
 	}
 	s.closeTranscription()
-	u := realtimeBase() + "/v1/realtime?intent=transcription"
+	base, err := realtimeBase()
+	if err != nil {
+		return err
+	}
+	u := base + "/v1/realtime?intent=transcription"
 	conn, _, err := websocket.DefaultDialer.Dial(u, http.Header{"Authorization": {"Bearer " + apiKey()}, "OpenAI-Safety-Identifier": {"co-translator-local-desktop"}})
 	if err != nil {
 		return err
@@ -470,6 +545,82 @@ func (s *server) readTranscription(conn *websocket.Conn) {
 			s.broadcast(map[string]interface{}{"type": "error", "message": "Realtime transcription API error"})
 		}
 	}
+}
+
+func validateAudioChunk(chunk audioChunk) error {
+	if !validBase64String(chunk.Base64PCM16, maxAudioBase64Length) {
+		return errors.New("audio chunk is invalid")
+	}
+	if chunk.CapturedAt <= 0 || chunk.ChunkMs <= 0 || chunk.ChunkMs > 1000 || chunk.RMS < 0 || chunk.RMS > 10 {
+		return errors.New("audio chunk metadata is invalid")
+	}
+	if chunk.SpeechStartedAt != nil && *chunk.SpeechStartedAt <= 0 {
+		return errors.New("audio chunk speech start is invalid")
+	}
+	return nil
+}
+
+func validateMeetingRequest(req meetingRequest) error {
+	if !validBase64String(req.Base64Audio, maxMeetingAudioBase64Length) {
+		return errors.New("meeting audio must be a base64 audio file under 25 MB")
+	}
+	if !validAudioMimeType(req.MimeType) {
+		return errors.New("meeting audio must include an audio MIME type")
+	}
+	if req.TargetLanguage == "" {
+		return errors.New("target language is required")
+	}
+	return nil
+}
+
+func validateSaveChunkRequest(req saveChunkRequest) error {
+	if !validSessionID(req.SessionID) {
+		return errors.New("meeting audio chunk session id is invalid")
+	}
+	if req.Sequence < 0 || req.Sequence > 999999 {
+		return errors.New("meeting audio chunk sequence is invalid")
+	}
+	if !validBase64String(req.Base64Audio, maxMeetingAudioChunkBase64Length) {
+		return errors.New("meeting audio chunk must be a base64 audio file under 6 MB")
+	}
+	if !validAudioMimeType(req.MimeType) {
+		return errors.New("meeting audio chunk must include an audio MIME type")
+	}
+	if req.CapturedAt <= 0 {
+		return errors.New("meeting audio chunk capture time is invalid")
+	}
+	return nil
+}
+
+func validSessionID(value string) bool {
+	if len(value) == 0 || len(value) > 80 {
+		return false
+	}
+	for _, char := range value {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') || char == '.' || char == '_' || char == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func validAudioMimeType(value string) bool {
+	return strings.HasPrefix(value, "audio/") && len(value) <= 120
+}
+
+func validBase64String(value string, maxLength int) bool {
+	if value == "" || len(value) > maxLength {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		char := value[i]
+		if (char >= 'A' && char <= 'Z') || (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9') || char == '+' || char == '/' || char == '=' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func (s *server) receiveAudio(chunk audioChunk) {
@@ -537,6 +688,9 @@ func (s *server) transcribeMeeting(req meetingRequest) (meetingResult, error) {
 	if err != nil {
 		return meetingResult{}, err
 	}
+	if len(audio) < 512 {
+		return meetingResult{}, errors.New("meeting audio is too short to transcribe")
+	}
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
 	file, _ := writer.CreateFormFile("file", meetingAudioFilename(req.MimeType))
@@ -548,7 +702,11 @@ func (s *server) transcribeMeeting(req meetingRequest) (meetingResult, error) {
 		_ = writer.WriteField("language", code)
 	}
 	_ = writer.Close()
-	httpReq, _ := http.NewRequest("POST", apiBase()+"/v1/audio/transcriptions", &body)
+	base, err := apiBase()
+	if err != nil {
+		return meetingResult{}, err
+	}
+	httpReq, _ := http.NewRequest("POST", base+"/v1/audio/transcriptions", &body)
 	httpReq.Header.Set("Authorization", "Bearer "+apiKey())
 	httpReq.Header.Set("OpenAI-Safety-Identifier", "co-translator-local-desktop")
 	httpReq.Header.Set("Content-Type", writer.FormDataContentType())
@@ -573,7 +731,11 @@ func (s *server) translateMeetingSegments(result meetingResult, req meetingReque
 	}
 	payload := map[string]interface{}{"model": getenv("OPENAI_MEETING_TRANSLATION_MODEL", "gpt-4.1-mini"), "input": fmt.Sprintf("{\"targetLanguage\":\"%s\",\"segments\":%s}", req.TargetLanguage, mustJSON(result.Segments))}
 	encoded, _ := json.Marshal(payload)
-	httpReq, _ := http.NewRequest("POST", apiBase()+"/v1/responses", bytes.NewReader(encoded))
+	base, err := apiBase()
+	if err != nil {
+		return result, err
+	}
+	httpReq, _ := http.NewRequest("POST", base+"/v1/responses", bytes.NewReader(encoded))
 	httpReq.Header.Set("Authorization", "Bearer "+apiKey())
 	httpReq.Header.Set("OpenAI-Safety-Identifier", "co-translator-local-desktop")
 	httpReq.Header.Set("Content-Type", "application/json")
@@ -628,6 +790,9 @@ func saveMeetingAudioChunk(req saveChunkRequest) error {
 	if err != nil {
 		return err
 	}
+	if len(audio) == 0 || len(audio) > maxMeetingAudioChunkBase64Length {
+		return errors.New("meeting audio chunk size is invalid")
+	}
 	dir := filepath.Join(userDataDir(), "meeting-audio", req.SessionID)
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
@@ -644,21 +809,76 @@ func userDataDir() string {
 }
 func apiKeyStorePath() string { return filepath.Join(userDataDir(), apiKeyStoreFile) }
 func apiKey() string {
-	if v := os.Getenv("OPENAI_API_KEY"); v != "" {
-		return v
+	if key := currentRuntimeAPIKey(); key != "" {
+		return key
 	}
+	if v := os.Getenv("OPENAI_API_KEY"); v != "" {
+		key, err := validateAPIKey(v)
+		if err != nil {
+			return ""
+		}
+		return key
+	}
+	return readStoredAPIKey()
+}
+func currentRuntimeAPIKey() string {
+	runtimeAPIKeyMu.Lock()
+	defer runtimeAPIKeyMu.Unlock()
+	return runtimeAPIKey
+}
+func setRuntimeAPIKey(key string) {
+	runtimeAPIKeyMu.Lock()
+	runtimeAPIKey = key
+	runtimeAPIKeyMu.Unlock()
+}
+func readStoredAPIKey() string {
 	data, _ := os.ReadFile(apiKeyStorePath())
 	var stored struct {
-		Value string `json:"value"`
+		Encoding string `json:"encoding"`
+		Value    string `json:"value"`
 	}
 	_ = json.Unmarshal(data, &stored)
-	return stored.Value
+	if stored.Encoding != "local" && stored.Encoding != "plaintext-v1" {
+		return ""
+	}
+	key, err := validateAPIKey(stored.Value)
+	if err != nil {
+		return ""
+	}
+	return key
 }
-func apiBase() string {
-	return strings.TrimRight(getenv("OPENAI_API_BASE_URL", "https://api.openai.com"), "/")
+func validateAPIKey(value string) (string, error) {
+	key := strings.TrimSpace(value)
+	if key == "" {
+		return "", errors.New("API key is required")
+	}
+	if !strings.HasPrefix(key, "sk-") || len(key) > maxAPIKeyLength {
+		return "", errors.New("API key must start with sk- and fit the expected length")
+	}
+	return key, nil
 }
-func realtimeBase() string {
-	return strings.TrimRight(getenv("OPENAI_REALTIME_WS_BASE_URL", "wss://api.openai.com"), "/")
+func apiBase() (string, error) {
+	return validatedOpenAIBaseURL("OPENAI_API_BASE_URL", "https://api.openai.com", "https")
+}
+func realtimeBase() (string, error) {
+	return validatedOpenAIBaseURL("OPENAI_REALTIME_WS_BASE_URL", "wss://api.openai.com", "wss")
+}
+func validatedOpenAIBaseURL(envName, fallback, requiredScheme string) (string, error) {
+	raw := strings.TrimSpace(getenv(envName, fallback))
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" || parsed.Hostname() == "" {
+		return "", fmt.Errorf("%s is not a valid URL", envName)
+	}
+	overrideAllowed := os.Getenv(allowOpenAIBaseURLOverrideFlag) == "1"
+	developmentSchemeAllowed := overrideAllowed && ((requiredScheme == "https" && parsed.Scheme == "http") || (requiredScheme == "wss" && parsed.Scheme == "ws"))
+	if parsed.Scheme != requiredScheme && !developmentSchemeAllowed {
+		return "", fmt.Errorf("%s must use %s", envName, requiredScheme)
+	}
+	defaultURL, _ := url.Parse(fallback)
+	if parsed.Hostname() != defaultURL.Hostname() && !overrideAllowed {
+		return "", fmt.Errorf("%s can only target %s unless %s=1", envName, defaultURL.Hostname(), allowOpenAIBaseURLOverrideFlag)
+	}
+	return strings.TrimRight(parsed.String(), "/"), nil
 }
 func getenv(k, fallback string) string {
 	if v := os.Getenv(k); v != "" {
