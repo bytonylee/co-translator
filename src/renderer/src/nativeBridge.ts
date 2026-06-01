@@ -26,14 +26,31 @@ type PendingCall = {
 
 const viteEnv = (import.meta as unknown as { env?: Record<string, string | undefined> }).env;
 const bridgePort = viteEnv?.VITE_CO_TRANSLATOR_BRIDGE_PORT || "41873";
-const bridgeUrl = `ws://127.0.0.1:${bridgePort}/bridge`;
+const bridgeBaseUrl = `ws://127.0.0.1:${bridgePort}/bridge`;
+const devBridgeToken = viteEnv?.VITE_CO_TRANSLATOR_BRIDGE_TOKEN;
+let bridgeToken = devBridgeToken || "";
 let ensureBackendPromise: Promise<void> | null = null;
+
+type BackendReady = {
+  bridgeToken?: string;
+};
+
+function bridgeUrl() {
+  if (!bridgeToken) {
+    return bridgeBaseUrl;
+  }
+  return `${bridgeBaseUrl}?token=${encodeURIComponent(bridgeToken)}`;
+}
 
 function ensureNativeBackend(): Promise<void> {
   if (!window.zero?.invoke) {
     return Promise.resolve();
   }
-  ensureBackendPromise ??= window.zero.invoke("coTranslator.ensureBackend").then(() => undefined).finally(() => {
+  ensureBackendPromise ??= window.zero.invoke<BackendReady>("coTranslator.ensureBackend").then((result) => {
+    if (result?.bridgeToken) {
+      bridgeToken = result.bridgeToken;
+    }
+  }).finally(() => {
     ensureBackendPromise = null;
   });
   return ensureBackendPromise;
@@ -109,7 +126,8 @@ class NativeBridge {
     }
 
     this.connectPromise = ensureNativeBackend().then(() => new Promise((resolve, reject) => {
-      const socket = new WebSocket(bridgeUrl);
+      const url = bridgeUrl();
+      const socket = new WebSocket(url);
       this.socket = socket;
       socket.onopen = () => {
         this.connectPromise = null;
@@ -117,7 +135,7 @@ class NativeBridge {
       };
       socket.onerror = () => {
         this.connectPromise = null;
-        reject(new Error(`Could not connect to Co Translator backend at ${bridgeUrl}.`));
+        reject(new Error(`Could not connect to Co Translator backend at ${bridgeBaseUrl}.`));
       };
       socket.onclose = () => {
         this.socket = null;
