@@ -8,6 +8,8 @@ const App = struct {
     io: std.Io,
     env_map: *std.process.Environ.Map,
     backend_child: ?std.process.Child = null,
+    bridge_token: [64]u8 = undefined,
+    bridge_token_ready: bool = false,
 
     fn app(self: *@This()) zero_native.App {
         return .{
@@ -42,6 +44,7 @@ const App = struct {
 
     fn startBackend(self: *@This()) !void {
         const allocator = std.heap.page_allocator;
+        _ = try self.ensureBridgeToken();
         const go_backend_path = try backendExecutablePath(self.io, allocator, "co-translator-backend");
         defer allocator.free(go_backend_path);
         const bun_script_path = try backendScriptPath(self.io, allocator, "server.bundle.js");
@@ -117,8 +120,9 @@ const App = struct {
     fn ensureBackendBridge(context: *anyopaque, invocation: zero_native.bridge.Invocation, output: []u8) anyerror![]const u8 {
         _ = invocation;
         const self: *@This() = @ptrCast(@alignCast(context));
+        const bridge_token = try self.ensureBridgeToken();
         try self.ensureBackend();
-        return std.fmt.bufPrint(output, "{{\"ok\":true}}", .{});
+        return std.fmt.bufPrint(output, "{{\"ok\":true,\"bridgeToken\":\"{s}\"}}", .{bridge_token});
     }
 
     fn prewarmBackendBridge(context: *anyopaque, invocation: zero_native.bridge.Invocation, output: []u8) anyerror![]const u8 {
@@ -150,10 +154,25 @@ const App = struct {
     fn spawnBackend(self: *@This(), argv: []const []const u8) !std.process.Child {
         return std.process.spawn(self.io, .{
             .argv = argv,
+            .environ_map = self.env_map,
             .stdin = .ignore,
             .stdout = .inherit,
             .stderr = .inherit,
         });
+    }
+
+    fn ensureBridgeToken(self: *@This()) ![]const u8 {
+        if (self.env_map.get("CO_TRANSLATOR_BRIDGE_TOKEN")) |token| {
+            if (token.len > 0) return token;
+        }
+        if (!self.bridge_token_ready) {
+            var raw: [32]u8 = undefined;
+            self.io.randomSecure(&raw) catch self.io.random(&raw);
+            self.bridge_token = std.fmt.bytesToHex(raw, .lower);
+            self.bridge_token_ready = true;
+            try self.env_map.put("CO_TRANSLATOR_BRIDGE_TOKEN", self.bridge_token[0..]);
+        }
+        return self.bridge_token[0..];
     }
 
     fn stopBackend(self: *@This()) void {
