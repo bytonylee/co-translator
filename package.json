@@ -6,7 +6,7 @@
   "description": "Zero Native desktop realtime translator using OpenAI Realtime translation.",
   "type": "module",
   "scripts": {
-    "dev": "npm run build:backend && zig build && concurrently -k \"node --max-old-space-size=32 --max-semi-space-size=1 dist/backend/server.js\" \"CO_TRANSLATOR_EXTERNAL_BACKEND=1 zero-native dev --binary zig-out/bin/co-translator\"",
+    "dev": "npm run build:backend && zig build && CO_TRANSLATOR_BRIDGE_TOKEN=$(node -e \"process.stdout.write(require('node:crypto').randomBytes(32).toString('hex'))\") concurrently -k \"node --max-old-space-size=32 --max-semi-space-size=1 dist/backend/server.js\" \"CO_TRANSLATOR_EXTERNAL_BACKEND=1 zero-native dev --binary zig-out/bin/co-translator\"",
     "dev:frontend": "vite --host 127.0.0.1",
     "dev:backend": "node --max-old-space-size=32 --max-semi-space-size=1 dist/backend/server.js",
     "version": "node scripts/version.mjs",
