@@ -1,10 +1,10 @@
-import { app, BrowserWindow, dialog, ipcMain, safeStorage, shell } from "electron";
-import type { IpcMainEvent, IpcMainInvokeEvent } from "electron";
 import fs from "node:fs";
+import http from "node:http";
+import os from "node:os";
 import path from "node:path";
+import { spawn } from "node:child_process";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import dotenv from "dotenv";
-import WebSocket from "ws";
 import { languageCode, languageOptions, targetLanguageOptions, transcriptionLanguageCode } from "../shared/languages.js";
 import {
   type ApiKeyStatus,
@@ -24,7 +24,8 @@ import {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "../..");
-const logDir = path.join(rootDir, "logs");
+const packagedBackend = __dirname.includes(".app/Contents/Resources/");
+const logDir = process.env.CO_TRANSLATOR_LOG_DIR || path.join(packagedBackend ? userDataDir() : rootDir, "logs");
 const latencyLogPath = path.join(logDir, "latency.ndjson");
 const apiKeyPageUrl = "https://platform.openai.com/settings/organization/api-keys";
 const apiKeyStoreFile = "openai-api-key.json";
@@ -34,28 +35,54 @@ const REALTIME_WHISPER_USD_PER_MINUTE = 0.017;
 const REALTIME_WHISPER_USD_PER_SECOND = 0.00028;
 const MEETING_DIARIZE_USD_PER_MINUTE = 0.006;
 const MEETING_DIARIZE_USD_PER_SECOND = MEETING_DIARIZE_USD_PER_MINUTE / 60;
-const TRANSCRIPTION_SPEECH_RMS_THRESHOLD = 0.012;
+const MEETING_TRANSLATION_MAX_OUTPUT_TOKENS = 4000;
+const TRANSCRIPTION_SPEECH_RMS_THRESHOLD = 0.006;
 const DEFAULT_TRANSCRIPTION_SILENCE_HOLD_MS = 600;
 const KOREAN_TRANSCRIPTION_SILENCE_HOLD_MS = 1000;
+const MIN_TRANSCRIPTION_COMMIT_MS = 100;
+const LOW_LATENCY_TRANSCRIPTION_COMMIT_MS = 480;
 const TRANSCRIPTION_LONG_BREAK_MS = 1800;
 const STOP_TRANSCRIPT_SETTLE_QUIET_MS = 350;
 const STOP_TRANSCRIPT_SETTLE_MAX_MS = 4000;
-const devServerUrl = "http://127.0.0.1:5173";
-const trustedDevOrigin = new URL(devServerUrl).origin;
+const DEFAULT_WARM_IDLE_TIMEOUT_MS = 300_000;
+const bridgePort = Number(process.env.CO_TRANSLATOR_BRIDGE_PORT || 41873);
+const defaultOpenAiApiBaseUrl = "https://api.openai.com";
+const defaultOpenAiRealtimeWsBaseUrl = "wss://api.openai.com";
+const allowOpenAiBaseUrlOverrideFlag = "CO_TRANSLATOR_ALLOW_OPENAI_BASE_URL_OVERRIDE";
 const maxApiKeyLength = 4096;
 const maxAudioBase64Length = 64 * 1024;
 const maxMeetingAudioChunkBase64Length = 6 * 1024 * 1024;
 const maxMeetingAudioBase64Length = 36 * 1024 * 1024;
 const maxExitSaveTextLength = 2 * 1024 * 1024;
+const maxBridgeMessageBytes = 40 * 1024 * 1024;
 const validLatencyModes = new Set<LatencyMode>(["fast", "webrtc", "balanced", "stable"]);
 const validSourceLanguages = new Set<string>(languageOptions);
 const validTargetLanguages = new Set<string>(targetLanguageOptions);
+const websocketConnecting = 0;
+const websocketOpen = 1;
 
-let mainWindow: BrowserWindow | null = null;
-let realtimeSocket: WebSocket | null = null;
-let realtimeSockets: WebSocket[] = [];
+type RealtimeSocket = {
+  readyState: number;
+  bufferedAmount: number;
+  send(data: string): void;
+  close(code?: number, reason?: string): void;
+  on?: (event: string, callback: (...args: any[]) => void) => void;
+  addEventListener?: (event: string, callback: (event: any) => void) => void;
+};
+
+type BridgeSocket = {
+  readyState?: number;
+  send(data: string): void;
+  on?: (event: string, callback: (...args: any[]) => void) => void;
+};
+
+const bridgeClients = new Set<BridgeSocket>();
+let bridgeTokenValue: string | null = null;
+let runtimeApiKey: string | null = null;
+let realtimeSocket: RealtimeSocket | null = null;
+let realtimeSockets: RealtimeSocket[] = [];
 let realtimeWinnerLane: number | undefined;
-let transcriptionSocket: WebSocket | null = null;
+let transcriptionSocket: RealtimeSocket | null = null;
 let sessionId = "";
 let finalizedSourceText = "";
 let finalizedTargetText = "";
@@ -66,9 +93,11 @@ let pendingTranscriptionAudioChunks: AudioChunk[] = [];
 let latencyConfig = getLatencyConfig("balanced");
 let latencySnapshot = createLatencySnapshot();
 let activeConfig: TranslatorConfig | null = null;
+let transcriptionConfig: TranslatorConfig | null = null;
 let isStreaming = false;
 let warmCloseTimer: NodeJS.Timeout | undefined;
 let warmConnectPromise: Promise<void> | null = null;
+let transcriptionConnectPromise: Promise<void> | null = null;
 let translationClientSecretRefreshTimer: NodeJS.Timeout | undefined;
 let firstSpeechAt: number | undefined;
 let firstAudioSentAt: number | undefined;
@@ -83,6 +112,10 @@ let transcriptionItemText = new Map<string, string>();
 let transcriptionItemSeparator = new Map<string, string>();
 let pendingTranscriptionItemSeparators: string[] = [];
 let transcriptionBufferHasAudio = false;
+let transcriptionBufferHasSpeech = false;
+let transcriptionBufferedAudioMs = 0;
+let transcriptionCommittedItemCount = 0;
+let nextTranscriptionItemSeparator = " ";
 let transcriptionSpeechActive = false;
 let transcriptionSilentMs = 0;
 let transcriptionSilenceHoldMs = DEFAULT_TRANSCRIPTION_SILENCE_HOLD_MS;
@@ -90,8 +123,6 @@ let transcriptionLastSpeechEndedAt: number | undefined;
 let lastTranscriptionTranscriptAt = 0;
 let transcriptionTranscriptWaiters: Array<() => void> = [];
 let exitSaveState: ExitSaveState = { sourceText: "", targetText: "" };
-let closeConfirmed = false;
-let closePromptActive = false;
 let cachedTranslationClientSecret: {
   config: TranslatorConfig;
   value: string;
@@ -99,7 +130,7 @@ let cachedTranslationClientSecret: {
 } | null = null;
 
 type StoredApiKey = {
-  encoding: "safeStorage" | "plain";
+  encoding: "local" | "plaintext-v1";
   value: string;
 };
 
@@ -123,7 +154,67 @@ function getLatencyConfig(mode: LatencyMode) {
 }
 
 function sendEvent(event: MainToRendererEvent) {
-  mainWindow?.webContents.send("translator:event", event);
+  broadcast({ type: "event", event });
+}
+
+function isBunRuntime() {
+  return typeof (globalThis as { Bun?: unknown }).Bun !== "undefined";
+}
+
+async function createRealtimeSocket(url: string, headers: Record<string, string>): Promise<RealtimeSocket> {
+  if (isBunRuntime()) {
+    const SocketCtor = globalThis.WebSocket as unknown as new (
+      url: string,
+      options: { headers: Record<string, string> }
+    ) => RealtimeSocket;
+    return new SocketCtor(url, { headers });
+  }
+
+  const { default: NodeWebSocket } = await import("ws");
+  return new NodeWebSocket(url, { headers }) as unknown as RealtimeSocket;
+}
+
+function onSocketOpen(socket: RealtimeSocket, callback: () => void) {
+  if (socket.addEventListener) {
+    socket.addEventListener("open", callback);
+    return;
+  }
+  socket.on?.("open", callback);
+}
+
+function onSocketMessage(socket: RealtimeSocket, callback: (data: string) => void) {
+  if (socket.addEventListener) {
+    socket.addEventListener("message", (event) => {
+      callback(String(event.data));
+    });
+    return;
+  }
+  socket.on?.("message", (data) => {
+    callback(data.toString());
+  });
+}
+
+function onSocketError(socket: RealtimeSocket, callback: (error: Error) => void) {
+  if (socket.addEventListener) {
+    socket.addEventListener("error", (event) => {
+      const message = typeof event.message === "string" ? event.message : "WebSocket error";
+      callback(new Error(message));
+    });
+    return;
+  }
+  socket.on?.("error", callback);
+}
+
+function onSocketClose(socket: RealtimeSocket, callback: (code: number, reason: string) => void) {
+  if (socket.addEventListener) {
+    socket.addEventListener("close", (event) => {
+      callback(Number(event.code), String(event.reason || ""));
+    });
+    return;
+  }
+  socket.on?.("close", (code, reason) => {
+    callback(Number(code), reason?.toString() || "");
+  });
 }
 
 function startLogSession() {
@@ -148,6 +239,7 @@ function logLatency(event: string, data: Record<string, unknown> = {}) {
   const serialized = JSON.stringify(line);
   console.log(`[latency] ${serialized}`);
   try {
+    fs.mkdirSync(logDir, { recursive: true });
     fs.appendFileSync(latencyLogPath, `${serialized}\n`, "utf8");
   } catch (error) {
     console.error("[latency] failed to write latency log", error);
@@ -171,6 +263,14 @@ function sameSessionConfig(left: TranslatorConfig | null, right: TranslatorConfi
   );
 }
 
+function sameTranscriptionConfig(left: TranslatorConfig | null, right: TranslatorConfig) {
+  return (
+    left !== null &&
+    left?.sourceLanguage === right.sourceLanguage &&
+    shouldTranscribeUserVoice(left) === shouldTranscribeUserVoice(right)
+  );
+}
+
 function shouldTranscribeUserVoice(config: TranslatorConfig) {
   return config.transcribeUserVoice !== false;
 }
@@ -184,16 +284,24 @@ function transcriptionSilenceHoldMsFor(config: TranslatorConfig) {
 }
 
 function socketIsOpen() {
-  return realtimeSockets.length > 0 && realtimeSockets.every((socket) => socket.readyState === WebSocket.OPEN);
+  return realtimeSockets.length > 0 && realtimeSockets.every((socket) => socket.readyState === websocketOpen);
 }
 
 function openRealtimeSockets() {
-  return realtimeSockets.filter((socket) => socket.readyState === WebSocket.OPEN);
+  return realtimeSockets.filter((socket) => socket.readyState === websocketOpen);
+}
+
+function transcriptionSocketIsOpen() {
+  return transcriptionSocket?.readyState === websocketOpen;
+}
+
+function warmResourceIsOpen() {
+  return socketIsOpen() || transcriptionSocketIsOpen();
 }
 
 function closeRealtimeSockets(code = 1000, reason = "closing realtime sockets") {
   for (const socket of realtimeSockets) {
-    if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+    if (socket.readyState === websocketOpen || socket.readyState === websocketConnecting) {
       socket.close(code, reason);
     }
   }
@@ -203,10 +311,11 @@ function closeRealtimeSockets(code = 1000, reason = "closing realtime sockets") 
 }
 
 function closeTranscriptionSocket(code = 1000, reason = "closing transcription socket") {
-  if (transcriptionSocket?.readyState === WebSocket.OPEN || transcriptionSocket?.readyState === WebSocket.CONNECTING) {
+  if (transcriptionSocket?.readyState === websocketOpen || transcriptionSocket?.readyState === websocketConnecting) {
     transcriptionSocket.close(code, reason);
   }
   transcriptionSocket = null;
+  transcriptionConfig = null;
   resetTranscriptionState();
 }
 
@@ -274,9 +383,9 @@ function scheduleTranslationClientSecretRefresh(config: TranslatorConfig) {
 }
 
 function scheduleWarmClose(reason: string) {
-  const warmIdleTimeoutMs = Number(process.env.OPENAI_WARM_IDLE_TIMEOUT_MS || 45_000);
+  const warmIdleTimeoutMs = Number(process.env.OPENAI_WARM_IDLE_TIMEOUT_MS || DEFAULT_WARM_IDLE_TIMEOUT_MS);
   clearWarmCloseTimer();
-  if (isStreaming || !realtimeSockets.length) {
+  if (isStreaming || (!realtimeSockets.length && !transcriptionSocket)) {
     return;
   }
   logLatency("warm_close_scheduled", {
@@ -284,11 +393,12 @@ function scheduleWarmClose(reason: string) {
     idleTimeoutMs: warmIdleTimeoutMs
   });
   warmCloseTimer = setTimeout(() => {
-    if (!isStreaming && realtimeSockets.length) {
+    if (!isStreaming && (realtimeSockets.length || transcriptionSocket)) {
       logLatency("warm_close_idle_timeout", {
         idleTimeoutMs: warmIdleTimeoutMs
       });
       closeRealtimeSockets(1000, "warm idle timeout");
+      closeTranscriptionSocket(1000, "warm idle timeout");
       activeConfig = null;
       sendEvent({ type: "state", state: "idle", message: "Warm socket closed" });
     }
@@ -315,46 +425,38 @@ function maxRealtimeBufferedAmount() {
   return realtimeSockets.reduce((maxBuffered, socket) => Math.max(maxBuffered, socket.bufferedAmount), 0);
 }
 
-function trustedRendererUrl(rawUrl: string) {
-  try {
-    const url = new URL(rawUrl);
-    if (!app.isPackaged && url.origin === trustedDevOrigin) {
-      return true;
-    }
-    return url.protocol === "file:" && url.pathname.endsWith("/dist/renderer/index.html");
-  } catch {
-    return false;
-  }
-}
-
-function isTrustedSender(event: IpcMainInvokeEvent | IpcMainEvent) {
-  const senderFrameUrl = event.senderFrame?.url;
-  return event.sender === mainWindow?.webContents && Boolean(senderFrameUrl && trustedRendererUrl(senderFrameUrl));
-}
-
-function assertTrustedSender(event: IpcMainInvokeEvent | IpcMainEvent) {
-  if (!isTrustedSender(event)) {
-    throw new Error("Rejected IPC call from an untrusted renderer.");
-  }
-}
-
-function normalizeDevServerUrl(rawUrl: string | undefined) {
-  if (app.isPackaged || !rawUrl) {
-    return null;
-  }
-  try {
-    const url = new URL(rawUrl);
-    if (url.origin === trustedDevOrigin) {
-      return devServerUrl;
-    }
-  } catch {
-    return null;
-  }
-  return null;
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function getBridgeToken() {
+  bridgeTokenValue ??= process.env.CO_TRANSLATOR_BRIDGE_TOKEN?.trim() || randomBytes(32).toString("hex");
+  return bridgeTokenValue;
+}
+
+function secureTokenEquals(actual: string, expected: string) {
+  const actualBuffer = Buffer.from(actual);
+  const expectedBuffer = Buffer.from(expected);
+  return actualBuffer.length === expectedBuffer.length && timingSafeEqual(actualBuffer, expectedBuffer);
+}
+
+function bridgeRequestIsAuthorized(rawUrl: string | undefined, origin: string | undefined | null) {
+  const url = new URL(rawUrl || "/bridge", "http://127.0.0.1");
+  const token = url.searchParams.get("token") || "";
+  if (!secureTokenEquals(token, getBridgeToken())) {
+    return false;
+  }
+  if (!origin) {
+    return true;
+  }
+  return new Set([
+    "zero://app",
+    "zero://inline",
+    "file://local",
+    "file://",
+    "http://127.0.0.1:5173",
+    "http://localhost:5173"
+  ]).has(origin);
 }
 
 function validateConfig(value: unknown): TranslatorConfig {
@@ -430,7 +532,7 @@ function validateMeetingTranscriptionRequest(value: unknown): MeetingTranscripti
   if (!isRecord(value)) {
     throw new Error("Meeting transcription request must be an object.");
   }
-  const { base64Audio, mimeType, sourceLanguage } = value;
+  const { base64Audio, mimeType, sourceLanguage, targetLanguage } = value;
   if (
     typeof base64Audio !== "string" ||
     base64Audio.length === 0 ||
@@ -445,10 +547,14 @@ function validateMeetingTranscriptionRequest(value: unknown): MeetingTranscripti
   if (typeof sourceLanguage !== "string" || !validSourceLanguages.has(sourceLanguage)) {
     throw new Error("Unsupported meeting source language.");
   }
+  if (typeof targetLanguage !== "string" || !validTargetLanguages.has(targetLanguage)) {
+    throw new Error("Unsupported meeting target language.");
+  }
   return {
     base64Audio,
     mimeType,
-    sourceLanguage
+    sourceLanguage,
+    targetLanguage
   };
 }
 
@@ -519,12 +625,12 @@ function sanitizeLogData(value: unknown) {
 
 function loadEnv() {
   for (const filename of [".env", ".env.local"]) {
-    const parsed = dotenv.config({ path: path.join(rootDir, filename), quiet: true }).parsed;
-    if (!parsed) {
+    const filePath = path.join(rootDir, filename);
+    if (!fs.existsSync(filePath)) {
       continue;
     }
 
-    for (const [key, value] of Object.entries(parsed)) {
+    for (const [key, value] of Object.entries(parseEnvFile(fs.readFileSync(filePath, "utf8")))) {
       if (value.trim()) {
         process.env[key] = value;
       }
@@ -532,8 +638,74 @@ function loadEnv() {
   }
 }
 
+function openAiApiBaseUrl() {
+  return validatedOpenAiBaseUrl("OPENAI_API_BASE_URL", defaultOpenAiApiBaseUrl, "https:");
+}
+
+function openAiRealtimeWsBaseUrl() {
+  return validatedOpenAiBaseUrl("OPENAI_REALTIME_WS_BASE_URL", defaultOpenAiRealtimeWsBaseUrl, "wss:");
+}
+
+function validatedOpenAiBaseUrl(envName: string, fallback: string, requiredProtocol: "https:" | "wss:") {
+  const rawValue = process.env[envName]?.trim() || fallback;
+  const url = new URL(rawValue);
+  const overrideAllowed = process.env[allowOpenAiBaseUrlOverrideFlag] === "1";
+  const developmentProtocolAllowed = overrideAllowed && (
+    (requiredProtocol === "https:" && url.protocol === "http:") ||
+    (requiredProtocol === "wss:" && url.protocol === "ws:")
+  );
+  if (url.protocol !== requiredProtocol && !developmentProtocolAllowed) {
+    throw new Error(`${envName} must use ${requiredProtocol.replace(":", "")}.`);
+  }
+  const normalized = url.toString().replace(/\/$/, "");
+  const defaultUrl = new URL(fallback);
+  if (url.hostname !== defaultUrl.hostname && !overrideAllowed) {
+    throw new Error(`${envName} can only target ${defaultUrl.hostname} unless ${allowOpenAiBaseUrlOverrideFlag}=1.`);
+  }
+  return normalized;
+}
+
+function parseEnvFile(contents: string) {
+  const parsed: Record<string, string> = {};
+  for (const rawLine of contents.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) {
+      continue;
+    }
+    const match = line.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+    if (!match) {
+      continue;
+    }
+    parsed[match[1]] = parseEnvValue(match[2]);
+  }
+  return parsed;
+}
+
+function parseEnvValue(value: string) {
+  const trimmed = value.trim();
+  const quote = trimmed[0];
+  if ((quote === "\"" || quote === "'") && trimmed.endsWith(quote)) {
+    const inner = trimmed.slice(1, -1);
+    return quote === "\"" ? inner.replace(/\\n/g, "\n").replace(/\\"/g, "\"").replace(/\\\\/g, "\\") : inner.replace(/\\'/g, "'");
+  }
+  return trimmed.replace(/\s+#.*$/, "");
+}
+
 function apiKeyStorePath() {
-  return path.join(app.getPath("userData"), apiKeyStoreFile);
+  return path.join(userDataDir(), apiKeyStoreFile);
+}
+
+function userDataDir() {
+  if (process.env.CO_TRANSLATOR_USER_DATA_DIR) {
+    return process.env.CO_TRANSLATOR_USER_DATA_DIR;
+  }
+  if (process.platform === "darwin") {
+    return path.join(os.homedir(), "Library", "Application Support", "Co Translator");
+  }
+  if (process.platform === "win32") {
+    return path.join(process.env.APPDATA || os.homedir(), "Co Translator");
+  }
+  return path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"), "co-translator");
 }
 
 function readStoredApiKey(): { apiKey: string; storage: ApiKeyStatus["storage"] } | null {
@@ -547,15 +719,11 @@ function readStoredApiKey(): { apiKey: string; storage: ApiKeyStatus["storage"] 
     if (!stored.value) {
       return null;
     }
-    if (stored.encoding === "safeStorage") {
+    if ((stored.encoding === "local" || stored.encoding === "plaintext-v1") && typeof stored.value === "string") {
       return {
-        apiKey: safeStorage.decryptString(Buffer.from(stored.value, "base64")),
-        storage: "encrypted"
+        apiKey: validateApiKey(stored.value),
+        storage: "local"
       };
-    }
-    if (stored.encoding === "plain") {
-      logLatency("api_key_store_plain_ignored");
-      return null;
     }
   } catch (error) {
     logLatency("api_key_store_read_error", {
@@ -567,31 +735,34 @@ function readStoredApiKey(): { apiKey: string; storage: ApiKeyStatus["storage"] 
 
 function writeStoredApiKey(apiKey: string): ApiKeyStatus {
   const trimmedApiKey = validateApiKey(apiKey);
-  const canEncrypt = safeStorage.isEncryptionAvailable();
-  if (!canEncrypt) {
-    throw new Error("OS encryption is unavailable. Set OPENAI_API_KEY in your environment instead.");
-  }
   const stored: StoredApiKey = {
-    encoding: "safeStorage",
-    value: safeStorage.encryptString(trimmedApiKey).toString("base64")
+    encoding: "plaintext-v1",
+    value: trimmedApiKey
   };
 
-  fs.mkdirSync(app.getPath("userData"), { recursive: true });
+  fs.mkdirSync(userDataDir(), { recursive: true, mode: 0o700 });
   fs.writeFileSync(apiKeyStorePath(), JSON.stringify(stored, null, 2), { encoding: "utf8", mode: 0o600 });
-  process.env.OPENAI_API_KEY = trimmedApiKey;
+  runtimeApiKey = trimmedApiKey;
   cachedTranslationClientSecret = null;
   clearTranslationClientSecretRefreshTimer();
   if (!isStreaming) {
     closeRealtimeSockets(1000, "api key updated");
+    closeTranscriptionSocket(1000, "api key updated");
     activeConfig = null;
   }
   return {
     configured: true,
-    storage: "encrypted"
+    storage: "local"
   };
 }
 
 function getApiKeyStatus(): ApiKeyStatus {
+  if (runtimeApiKey) {
+    return {
+      configured: true,
+      storage: "local"
+    };
+  }
   const stored = readStoredApiKey();
   if (stored?.apiKey) {
     return {
@@ -600,10 +771,18 @@ function getApiKeyStatus(): ApiKeyStatus {
     };
   }
   if (process.env.OPENAI_API_KEY) {
-    return {
-      configured: true,
-      storage: "environment"
-    };
+    try {
+      validateApiKey(process.env.OPENAI_API_KEY);
+      return {
+        configured: true,
+        storage: "environment"
+      };
+    } catch {
+      return {
+        configured: false,
+        storage: "none"
+      };
+    }
   }
   return {
     configured: false,
@@ -612,7 +791,7 @@ function getApiKeyStatus(): ApiKeyStatus {
 }
 
 function getApiKey() {
-  const apiKey = readStoredApiKey()?.apiKey || process.env.OPENAI_API_KEY;
+  const apiKey = runtimeApiKey || readStoredApiKey()?.apiKey || (process.env.OPENAI_API_KEY ? validateApiKey(process.env.OPENAI_API_KEY) : "");
   if (!apiKey) {
     logLatency("missing_api_key");
     throw new Error("OPENAI_API_KEY is missing. Add it in API key settings.");
@@ -645,7 +824,7 @@ async function getTranslationClientSecret(config: TranslatorConfig) {
     targetLanguageCode: languageCode(config.targetLanguage)
   });
 
-  const response = await fetch("https://api.openai.com/v1/realtime/translations/client_secrets", {
+  const response = await fetch(`${openAiApiBaseUrl()}/v1/realtime/translations/client_secrets`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${getApiKey()}`,
@@ -719,7 +898,7 @@ async function transcribeMeetingAudio(request: MeetingTranscriptionRequest): Pro
     form.append("language", language);
   }
 
-  const response = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+  const response = await fetch(`${openAiApiBaseUrl()}/v1/audio/transcriptions`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${getApiKey()}`,
@@ -736,14 +915,159 @@ async function transcribeMeetingAudio(request: MeetingTranscriptionRequest): Pro
     throw new Error(message);
   }
 
-  const result = normalizeMeetingTranscription(payload);
+  const result = await translateMeetingSegments(normalizeMeetingTranscription(payload), request);
   logLatency("meeting_transcription_ready", {
     model,
     readyMs: Date.now() - startedAt,
     segments: result.segments.length,
-    speakers: new Set(result.segments.map((segment) => segment.speaker)).size
+    speakers: new Set(result.segments.map((segment) => segment.speaker)).size,
+    targetLanguage: request.targetLanguage
   });
   return result;
+}
+
+async function translateMeetingSegments(result: MeetingTranscriptionResult, request: MeetingTranscriptionRequest): Promise<MeetingTranscriptionResult> {
+  if (!result.segments.length || (request.sourceLanguage !== "Auto" && request.sourceLanguage === request.targetLanguage)) {
+    return result;
+  }
+
+  const model = process.env.OPENAI_MEETING_TRANSLATION_MODEL || "gpt-4.1-mini";
+  const startedAt = Date.now();
+  logLatency("meeting_segment_translation_start", {
+    model,
+    sourceLanguage: request.sourceLanguage,
+    targetLanguage: request.targetLanguage,
+    segments: result.segments.length
+  });
+
+  const response = await fetch(`${openAiApiBaseUrl()}/v1/responses`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${getApiKey()}`,
+      "Content-Type": "application/json",
+      "OpenAI-Safety-Identifier": "co-translator-local-desktop"
+    },
+    body: JSON.stringify({
+      model,
+      store: false,
+      instructions: [
+        `Translate each meeting segment into ${request.targetLanguage}.`,
+        "Preserve meaning, speaker order, punctuation, and line breaks where natural.",
+        "Return only the requested JSON shape. Do not include source-language text unless it is a name or untranslatable term."
+      ].join(" "),
+      input: JSON.stringify({
+        sourceLanguage: request.sourceLanguage,
+        targetLanguage: request.targetLanguage,
+        segments: result.segments.map((segment, index) => ({
+          index,
+          speaker: segment.speaker,
+          text: segment.text
+        }))
+      }),
+      max_output_tokens: MEETING_TRANSLATION_MAX_OUTPUT_TOKENS,
+      text: {
+        format: {
+          type: "json_schema",
+          name: "meeting_segment_translations",
+          strict: true,
+          schema: {
+            type: "object",
+            additionalProperties: false,
+            required: ["segments"],
+            properties: {
+              segments: {
+                type: "array",
+                items: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["index", "text"],
+                  properties: {
+                    index: { type: "integer" },
+                    text: { type: "string" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    })
+  });
+
+  const payload = await response.json().catch(() => null) as unknown;
+  if (!response.ok) {
+    const message = isRecord(payload) && isRecord(payload.error) && typeof payload.error.message === "string"
+      ? payload.error.message
+      : `Could not translate diarized meeting text (${response.status}).`;
+    throw new Error(message);
+  }
+
+  const translatedText = extractResponseOutputText(payload);
+  const translatedSegments = normalizeMeetingSegmentTranslations(translatedText, result.segments);
+  logLatency("meeting_segment_translation_ready", {
+    model,
+    readyMs: Date.now() - startedAt,
+    segments: translatedSegments.length
+  });
+  return {
+    segments: translatedSegments,
+    text: translatedSegments.map((segment) => `${segment.speaker}: ${segment.text}`).join("\n\n")
+  };
+}
+
+function normalizeMeetingSegmentTranslations(rawText: string, sourceSegments: MeetingTranscriptSegment[]) {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawText);
+  } catch {
+    throw new Error("Meeting translation response was not valid JSON.");
+  }
+  if (!isRecord(parsed) || !Array.isArray(parsed.segments)) {
+    throw new Error("Meeting translation response did not include segments.");
+  }
+
+  const translations = new Map<number, string>();
+  for (const rawSegment of parsed.segments) {
+    if (!isRecord(rawSegment) || typeof rawSegment.index !== "number" || !Number.isInteger(rawSegment.index) || typeof rawSegment.text !== "string") {
+      continue;
+    }
+    const text = rawSegment.text.trim();
+    if (text) {
+      translations.set(rawSegment.index, text);
+    }
+  }
+
+  return sourceSegments.map((segment, index) => {
+    const translatedText = translations.get(index);
+    if (!translatedText) {
+      throw new Error("Meeting translation response was missing a segment.");
+    }
+    return {
+      ...segment,
+      text: translatedText
+    };
+  });
+}
+
+function extractResponseOutputText(payload: unknown) {
+  if (!isRecord(payload)) {
+    throw new Error("Meeting translation response was not valid JSON.");
+  }
+  if (typeof payload.output_text === "string" && payload.output_text.trim()) {
+    return payload.output_text.trim();
+  }
+  const output = Array.isArray(payload.output) ? payload.output : [];
+  for (const item of output) {
+    if (!isRecord(item) || !Array.isArray(item.content)) {
+      continue;
+    }
+    for (const content of item.content) {
+      if (isRecord(content) && typeof content.text === "string" && content.text.trim()) {
+        return content.text.trim();
+      }
+    }
+  }
+  throw new Error("Meeting translation response did not include output text.");
 }
 
 async function saveMeetingAudioChunk(request: MeetingAudioChunkSaveRequest) {
@@ -751,7 +1075,7 @@ async function saveMeetingAudioChunk(request: MeetingAudioChunkSaveRequest) {
   if (!audio.length) {
     throw new Error("Meeting audio chunk was empty.");
   }
-  const directory = path.join(app.getPath("userData"), "meeting-audio", request.sessionId);
+  const directory = path.join(userDataDir(), "meeting-audio", request.sessionId);
   const filename = meetingAudioChunkFilename(request.mimeType, request.sequence);
   await fs.promises.mkdir(directory, { recursive: true });
   await fs.promises.writeFile(path.join(directory, filename), audio, { mode: 0o600 });
@@ -847,107 +1171,11 @@ function mergeConsecutiveMeetingSegments(segments: MeetingTranscriptSegment[]) {
   return grouped;
 }
 
-function createWindow() {
-  closeConfirmed = false;
-  closePromptActive = false;
-  exitSaveState = { sourceText: "", targetText: "" };
-  mainWindow = new BrowserWindow({
-    width: 1080,
-    height: 760,
-    minWidth: 860,
-    minHeight: 620,
-    title: "Co Translator",
-    backgroundColor: "#060606",
-    webPreferences: {
-      preload: path.join(__dirname, "../preload/preload.cjs"),
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: true
-    }
-  });
-
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (url === apiKeyPageUrl) {
-      void shell.openExternal(url);
-    }
-    return { action: "deny" };
-  });
-  mainWindow.webContents.on("will-navigate", (event, url) => {
-    if (!trustedRendererUrl(url)) {
-      event.preventDefault();
-    }
-  });
-
-  mainWindow.on("close", (event) => {
-    if (closeConfirmed || !hasExitSaveText()) {
-      return;
-    }
-    event.preventDefault();
-    if (closePromptActive || !mainWindow) {
-      return;
-    }
-    closePromptActive = true;
-    void confirmCloseWithSave(mainWindow).finally(() => {
-      closePromptActive = false;
-    });
-  });
-
-  const normalizedDevUrl = normalizeDevServerUrl(process.env.VITE_DEV_SERVER_URL);
-  if (normalizedDevUrl) {
-    mainWindow.loadURL(normalizedDevUrl);
-  } else {
-    mainWindow.loadFile(path.join(__dirname, "../renderer/index.html"));
+async function saveExitTexts(directory: string) {
+  if (!path.isAbsolute(directory)) {
+    throw new Error("Transcript save directory must be an absolute path.");
   }
-
-  mainWindow.on("closed", () => {
-    mainWindow = null;
-  });
-}
-
-async function confirmCloseWithSave(window: BrowserWindow) {
-  const { response } = await dialog.showMessageBox(window, {
-    type: "question",
-    title: "Save transcript?",
-    message: "Save transcribed and translated text before leaving?",
-    detail: "Co Translator will save two Markdown files: user voice transcription and translated text.",
-    buttons: ["Save", "Don't Save", "Cancel"],
-    defaultId: 0,
-    cancelId: 2,
-    noLink: true
-  });
-
-  if (response === 2 || window.isDestroyed()) {
-    return;
-  }
-  if (response === 0) {
-    const saved = await saveExitTexts(window).catch(async (error: unknown) => {
-      await dialog.showMessageBox(window, {
-        type: "error",
-        title: "Could not save transcripts",
-        message: error instanceof Error ? error.message : "Co Translator could not write the transcript files."
-      });
-      return false;
-    });
-    if (!saved || window.isDestroyed()) {
-      return;
-    }
-  }
-
-  closeConfirmed = true;
-  window.close();
-}
-
-async function saveExitTexts(window: BrowserWindow) {
-  const { canceled, filePaths } = await dialog.showOpenDialog(window, {
-    title: "Choose where to save transcripts",
-    defaultPath: app.getPath("documents"),
-    properties: ["openDirectory", "createDirectory"]
-  });
-  const directory = filePaths[0];
-  if (canceled || !directory) {
-    return false;
-  }
-
+  await fs.promises.mkdir(directory, { recursive: true });
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const sourcePath = path.join(directory, `${timestamp}-user-transcription.md`);
   const targetPath = path.join(directory, `${timestamp}-translated-text.md`);
@@ -971,7 +1199,7 @@ function connectRealtime(config: TranslatorConfig, readyState: "connected" | "wa
 
   return new Promise<void>((resolve, reject) => {
     const model = process.env.OPENAI_REALTIME_MODEL || "gpt-realtime-translate";
-    const url = `wss://api.openai.com/v1/realtime/translations?model=${encodeURIComponent(model)}`;
+    const url = `${openAiRealtimeWsBaseUrl()}/v1/realtime/translations?model=${encodeURIComponent(model)}`;
     const raceCount = realtimeRaceSocketCount(config);
     let settled = false;
     let sessionReadyTimeout: NodeJS.Timeout | undefined;
@@ -1031,14 +1259,20 @@ function connectRealtime(config: TranslatorConfig, readyState: "connected" | "wa
       }
     }, 3000);
 
-    const sockets = Array.from({ length: raceCount }, (_, lane) => {
-      const socket = new WebSocket(url, {
-        headers: {
+    void (async () => {
+      const sockets: RealtimeSocket[] = [];
+      realtimeSockets = sockets;
+      realtimeSocket = null;
+
+      for (let lane = 0; lane < raceCount; lane += 1) {
+        const socket = await createRealtimeSocket(url, {
           Authorization: `Bearer ${apiKey}`,
           "OpenAI-Safety-Identifier": "co-translator-local-desktop"
-        }
-      });
-      socket.on("open", () => {
+        });
+        sockets.push(socket);
+        realtimeSocket = sockets[0] || null;
+
+        onSocketOpen(socket, () => {
         logLatency("ws_open", {
           connectMs: Date.now() - connectStartedAt,
           lane,
@@ -1067,8 +1301,8 @@ function connectRealtime(config: TranslatorConfig, readyState: "connected" | "wa
         });
       });
 
-      socket.on("message", (data) => {
-        const event = parseRealtimeEvent(data.toString());
+        onSocketMessage(socket, (data) => {
+        const event = parseRealtimeEvent(data);
         if (!event) {
           return;
         }
@@ -1084,7 +1318,7 @@ function connectRealtime(config: TranslatorConfig, readyState: "connected" | "wa
         handleRealtimeEvent(event, lane, raceCount);
       });
 
-      socket.on("error", (error) => {
+        onSocketError(socket, (error) => {
         logLatency("ws_error", {
           message: error.message,
           lane,
@@ -1099,11 +1333,11 @@ function connectRealtime(config: TranslatorConfig, readyState: "connected" | "wa
         }
       });
 
-      socket.on("close", (code, reason) => {
+        onSocketClose(socket, (code, reason) => {
         const isCurrentSocket = realtimeSockets.includes(socket);
         logLatency("ws_close", {
           code,
-          reason: reason.toString(),
+          reason,
           isCurrentSocket,
           lane,
           raceSockets: raceCount
@@ -1126,10 +1360,12 @@ function connectRealtime(config: TranslatorConfig, readyState: "connected" | "wa
           sendEvent({ type: "state", state: "idle" });
         }
       });
-      return socket;
+      }
+    })().catch((error: unknown) => {
+      clearSessionReadyTimeout();
+      settled = true;
+      reject(error instanceof Error ? error : new Error("Could not create Realtime WebSocket."));
     });
-    realtimeSockets = sockets;
-    realtimeSocket = sockets[0] || null;
   });
 }
 
@@ -1138,7 +1374,7 @@ function connectTranscription(config: TranslatorConfig) {
 
   return new Promise<void>((resolve, reject) => {
     const model = process.env.OPENAI_REALTIME_TRANSCRIPTION_MODEL || "gpt-realtime-whisper";
-    const url = "wss://api.openai.com/v1/realtime?intent=transcription";
+    const url = `${openAiRealtimeWsBaseUrl()}/v1/realtime?intent=transcription`;
     const language = transcriptionLanguageCode(config.sourceLanguage);
     const connectStartedAt = Date.now();
     let settled = false;
@@ -1146,6 +1382,7 @@ function connectTranscription(config: TranslatorConfig) {
 
     closeTranscriptionSocket(1000, "replacing transcription socket");
     resetTranscriptionState();
+    transcriptionConfig = config;
     transcriptionSilenceHoldMs = transcriptionSilenceHoldMsFor(config);
 
     logLatency("transcription_connect_start", {
@@ -1155,15 +1392,14 @@ function connectTranscription(config: TranslatorConfig) {
       silenceHoldMs: transcriptionSilenceHoldMs
     });
 
-    const socket = new WebSocket(url, {
-      headers: {
+    void (async () => {
+      const socket = await createRealtimeSocket(url, {
         Authorization: `Bearer ${apiKey}`,
         "OpenAI-Safety-Identifier": "co-translator-local-desktop"
-      }
-    });
-    transcriptionSocket = socket;
+      });
+      transcriptionSocket = socket;
 
-    const markReady = (reason: string) => {
+      const markReady = (reason: string) => {
       if (settled) {
         return;
       }
@@ -1180,11 +1416,11 @@ function connectTranscription(config: TranslatorConfig) {
       resolve();
     };
 
-    readyTimeout = setTimeout(() => {
+      readyTimeout = setTimeout(() => {
       markReady("transcription_session_update_ack_timeout");
     }, 3000);
 
-    socket.on("open", () => {
+      onSocketOpen(socket, () => {
       logLatency("transcription_ws_open", {
         connectMs: Date.now() - connectStartedAt
       });
@@ -1216,8 +1452,8 @@ function connectTranscription(config: TranslatorConfig) {
       });
     });
 
-    socket.on("message", (data) => {
-      const event = parseRealtimeEvent(data.toString());
+      onSocketMessage(socket, (data) => {
+      const event = parseRealtimeEvent(data);
       if (!event) {
         return;
       }
@@ -1228,7 +1464,7 @@ function connectTranscription(config: TranslatorConfig) {
       handleTranscriptionEvent(event);
     });
 
-    socket.on("error", (error) => {
+      onSocketError(socket, (error) => {
       logLatency("transcription_ws_error", {
         message: error.message
       });
@@ -1244,15 +1480,16 @@ function connectTranscription(config: TranslatorConfig) {
       }
     });
 
-    socket.on("close", (code, reason) => {
+      onSocketClose(socket, (code, reason) => {
       const isCurrentSocket = transcriptionSocket === socket;
       logLatency("transcription_ws_close", {
         code,
-        reason: reason.toString(),
+        reason,
         isCurrentSocket
       });
       if (isCurrentSocket) {
         transcriptionSocket = null;
+        transcriptionConfig = null;
       }
       if (!settled && code !== 1000 && code !== 1005) {
         if (readyTimeout) {
@@ -1260,10 +1497,44 @@ function connectTranscription(config: TranslatorConfig) {
           readyTimeout = undefined;
         }
         settled = true;
-        reject(new Error(reason.toString() || `Transcription WebSocket closed with code ${code}`));
+        reject(new Error(reason || `Transcription WebSocket closed with code ${code}`));
       }
     });
+    })().catch((error: unknown) => {
+      if (readyTimeout) {
+        clearTimeout(readyTimeout);
+        readyTimeout = undefined;
+      }
+      settled = true;
+      reject(error instanceof Error ? error : new Error("Could not create transcription WebSocket."));
+    });
   });
+}
+
+async function ensureTranscriptionConnected(config: TranslatorConfig) {
+  transcriptionSilenceHoldMs = transcriptionSilenceHoldMsFor(config);
+  if (transcriptionSocketIsOpen() && sameTranscriptionConfig(transcriptionConfig, config)) {
+    logLatency("transcription_warm_reused", {
+      sourceLanguage: config.sourceLanguage,
+      sourceLanguageCode: transcriptionLanguageCode(config.sourceLanguage)
+    });
+    flushPendingTranscriptionAudio();
+    return;
+  }
+
+  if (transcriptionConnectPromise && sameTranscriptionConfig(transcriptionConfig, config)) {
+    logLatency("transcription_wait_for_warm_socket", {
+      sourceLanguage: config.sourceLanguage,
+      sourceLanguageCode: transcriptionLanguageCode(config.sourceLanguage)
+    });
+    await transcriptionConnectPromise;
+    return;
+  }
+
+  transcriptionConnectPromise = connectTranscription(config).finally(() => {
+    transcriptionConnectPromise = null;
+  });
+  await transcriptionConnectPromise;
 }
 
 function parseRealtimeEvent(raw: string) {
@@ -1347,7 +1618,7 @@ function handleRealtimeEvent(event: Record<string, unknown>, lane = 0, raceCount
   }
 
   if (event.type === "session.input_transcript.delta") {
-    if (transcriptionSocket) {
+    if (transcriptionSocket && currentTranscriptionText()) {
       return;
     }
     const delta = typeof event.delta === "string" ? event.delta : "";
@@ -1370,7 +1641,7 @@ function handleRealtimeEvent(event: Record<string, unknown>, lane = 0, raceCount
   }
 
   if (event.type === "session.input_transcript.done") {
-    if (transcriptionSocket) {
+    if (transcriptionSocket && currentTranscriptionText()) {
       return;
     }
     const transcript = typeof event.transcript === "string" ? event.transcript : sourceSegmentText;
@@ -1459,7 +1730,7 @@ function handleTranscriptionEvent(event: Record<string, unknown>) {
   if (!transcriptionItemText.has(itemId)) {
     transcriptionItemOrder.push(itemId);
     transcriptionItemText.set(itemId, "");
-    transcriptionItemSeparator.set(itemId, transcriptionItemOrder.length === 1 ? "" : pendingTranscriptionItemSeparators.shift() || "\n");
+    transcriptionItemSeparator.set(itemId, transcriptionItemOrder.length === 1 ? "" : pendingTranscriptionItemSeparators.shift() ?? "\n");
   }
 
   if (event.type === "conversation.item.input_audio_transcription.delta") {
@@ -1504,7 +1775,7 @@ function currentTranscriptionText() {
   for (const itemId of transcriptionItemOrder) {
     const itemText = transcriptionItemText.get(itemId)?.trim();
     if (itemText) {
-      const separator = text ? transcriptionItemSeparator.get(itemId) || "\n" : "";
+      const separator = text ? transcriptionItemSeparator.get(itemId) ?? "\n" : "";
       text = `${text}${separator}${normalizeTranscriptWhitespace(itemText)}`;
     }
   }
@@ -1536,8 +1807,7 @@ function needsJoinSpace(previous: string, next: string) {
   return !/[\s([{“‘"']$/.test(previous) && !/^[\s,.;:!?)}\]。？！、，；：）]/.test(next);
 }
 
-ipcMain.handle("translator:start", async (event, rawConfig: unknown) => {
-  assertTrustedSender(event);
+async function startSession(rawConfig: unknown) {
   const config = validateConfig(rawConfig);
   clearWarmCloseTimer();
   clearTranslationClientSecretRefreshTimer();
@@ -1559,7 +1829,9 @@ ipcMain.handle("translator:start", async (event, rawConfig: unknown) => {
     latencyConfig = getLatencyConfig(config.latencyMode);
     resetStreamingState();
     if (shouldOpenSeparateTranscriptionSocket(config)) {
-      await connectTranscription(config);
+      await ensureTranscriptionConnected(config);
+    } else {
+      closeTranscriptionSocket(1000, "transcription disabled");
     }
     sendEvent({ type: "state", state: "connected", message: "Using warm Realtime socket" });
     publishLatency({ rootCause: "Warm WebSocket reused; waiting for speech" }, true);
@@ -1569,21 +1841,22 @@ ipcMain.handle("translator:start", async (event, rawConfig: unknown) => {
   closeRealtimeSockets(1000, "starting new realtime session");
   sendEvent({ type: "state", state: "connecting", message: "Connecting to OpenAI Realtime" });
   if (shouldOpenSeparateTranscriptionSocket(config)) {
-    await Promise.all([connectRealtime(config), connectTranscription(config)]);
+    await Promise.all([connectRealtime(config), ensureTranscriptionConnected(config)]);
   } else {
     closeTranscriptionSocket(1000, "transcription disabled");
     await connectRealtime(config);
   }
-});
+}
 
-ipcMain.handle("translator:start-translation-call", async (event, rawConfig: unknown): Promise<TranslationCallStart> => {
-  assertTrustedSender(event);
+async function startTranslationCall(rawConfig: unknown): Promise<TranslationCallStart> {
   const config = validateConfig(rawConfig);
   clearWarmCloseTimer();
   clearTranslationClientSecretRefreshTimer();
   isStreaming = true;
   startLogSession();
   resetStreamingState();
+  latencyConfig = getLatencyConfig(config.latencyMode);
+  activeConfig = config;
   logLatency("translator_start", {
     sourceLanguage: config.sourceLanguage,
     targetLanguage: config.targetLanguage,
@@ -1592,12 +1865,16 @@ ipcMain.handle("translator:start-translation-call", async (event, rawConfig: unk
     reusedTranslationClientSecret: translationClientSecretIsFresh(config)
   });
   sendEvent({ type: "state", state: "connecting", message: "Connecting WebRTC translation" });
-  const clientSecret = await getTranslationClientSecret(config);
+  const [clientSecret] = await Promise.all([
+    getTranslationClientSecret(config),
+    shouldOpenSeparateTranscriptionSocket(config)
+      ? ensureTranscriptionConnected(config)
+      : Promise.resolve(closeTranscriptionSocket(1000, "transcription disabled"))
+  ]);
   return { clientSecret };
-});
+}
 
-ipcMain.handle("translator:stop", async (event) => {
-  assertTrustedSender(event);
+async function stopSession() {
   logLatency("translator_stop", latencySnapshot);
   sendEvent({ type: "state", state: "stopping", message: "Stopping" });
   await stopTranscriptionSocket();
@@ -1609,41 +1886,34 @@ ipcMain.handle("translator:stop", async (event) => {
   pendingTranscriptionAudioChunks = [];
   firstSpeechAt = undefined;
   firstAudioSentAt = undefined;
-  sendEvent({ type: "state", state: socketIsOpen() ? "warm" : "idle", message: socketIsOpen() ? "Warm socket ready" : "idle" });
-});
+  sendEvent({ type: "state", state: warmResourceIsOpen() ? "warm" : "idle", message: warmResourceIsOpen() ? "Warm socket ready" : "idle" });
+}
 
-ipcMain.handle("translator:get-api-key-status", async (event): Promise<ApiKeyStatus> => {
-  assertTrustedSender(event);
+async function apiKeyStatusCommand(): Promise<ApiKeyStatus> {
   return getApiKeyStatus();
-});
+}
 
-ipcMain.handle("translator:get-api-pricing", async (event): Promise<ApiPricing> => {
-  assertTrustedSender(event);
+async function apiPricingCommand(): Promise<ApiPricing> {
   return getApiPricing();
-});
+}
 
-ipcMain.handle("translator:set-api-key", async (event, apiKey: unknown): Promise<ApiKeyStatus> => {
-  assertTrustedSender(event);
+async function setApiKeyCommand(apiKey: unknown): Promise<ApiKeyStatus> {
   return writeStoredApiKey(validateApiKey(apiKey));
-});
+}
 
-ipcMain.handle("translator:open-api-key-page", async (event) => {
-  assertTrustedSender(event);
-  await shell.openExternal(apiKeyPageUrl);
-});
+async function openApiKeyPageCommand() {
+  await openExternal(apiKeyPageUrl);
+}
 
-ipcMain.handle("translator:meeting-transcribe", async (event, rawRequest: unknown): Promise<MeetingTranscriptionResult> => {
-  assertTrustedSender(event);
+async function meetingTranscribeCommand(rawRequest: unknown): Promise<MeetingTranscriptionResult> {
   return transcribeMeetingAudio(validateMeetingTranscriptionRequest(rawRequest));
-});
+}
 
-ipcMain.handle("translator:save-meeting-audio-chunk", async (event, rawRequest: unknown): Promise<void> => {
-  assertTrustedSender(event);
+async function saveMeetingAudioChunkCommand(rawRequest: unknown): Promise<void> {
   await saveMeetingAudioChunk(validateMeetingAudioChunkSaveRequest(rawRequest));
-});
+}
 
-ipcMain.handle("translator:warm", async (event, rawConfig: unknown) => {
-  assertTrustedSender(event);
+async function warmSession(rawConfig: unknown) {
   const config = validateConfig(rawConfig);
   if (isStreaming) {
     return;
@@ -1659,8 +1929,14 @@ ipcMain.handle("translator:warm", async (event, rawConfig: unknown) => {
       closeRealtimeSockets(1000, "switching to WebRTC translation");
       activeConfig = null;
     }
-    await getTranslationClientSecret(config);
+    await Promise.all([
+      getTranslationClientSecret(config),
+      shouldOpenSeparateTranscriptionSocket(config)
+        ? ensureTranscriptionConnected(config)
+        : Promise.resolve(closeTranscriptionSocket(1000, "transcription disabled"))
+    ]);
     scheduleTranslationClientSecretRefresh(config);
+    scheduleWarmClose("webrtc warm connected");
     sendEvent({ type: "state", state: "warm", message: "Warm translation token ready" });
     return;
   }
@@ -1672,6 +1948,11 @@ ipcMain.handle("translator:warm", async (event, rawConfig: unknown) => {
       targetLanguage: config.targetLanguage,
       latencyMode: config.latencyMode
     });
+    if (shouldOpenSeparateTranscriptionSocket(config)) {
+      await ensureTranscriptionConnected(config);
+    } else {
+      closeTranscriptionSocket(1000, "transcription disabled");
+    }
     scheduleWarmClose("warm refresh");
     sendEvent({ type: "state", state: "warm", message: "Warm socket ready" });
     return;
@@ -1683,6 +1964,11 @@ ipcMain.handle("translator:warm", async (event, rawConfig: unknown) => {
       latencyMode: config.latencyMode
     });
     await warmConnectPromise;
+    if (shouldOpenSeparateTranscriptionSocket(config)) {
+      await ensureTranscriptionConnected(config);
+    } else {
+      closeTranscriptionSocket(1000, "transcription disabled");
+    }
     scheduleWarmClose("warm connected");
     sendEvent({ type: "state", state: "warm", message: "Warm socket ready" });
     return;
@@ -1699,10 +1985,15 @@ ipcMain.handle("translator:warm", async (event, rawConfig: unknown) => {
   warmConnectPromise = connectRealtime(config, "warm").finally(() => {
     warmConnectPromise = null;
   });
-  await warmConnectPromise;
+  await Promise.all([
+    warmConnectPromise,
+    shouldOpenSeparateTranscriptionSocket(config)
+      ? ensureTranscriptionConnected(config)
+      : Promise.resolve(closeTranscriptionSocket(1000, "transcription disabled"))
+  ]);
   scheduleWarmClose("warm connected");
   sendEvent({ type: "state", state: "warm", message: "Warm socket ready" });
-});
+}
 
 function resetStreamingState() {
   resetRealtimeState();
@@ -1733,6 +2024,10 @@ function resetTranscriptionState() {
   transcriptionItemSeparator = new Map<string, string>();
   pendingTranscriptionItemSeparators = [];
   transcriptionBufferHasAudio = false;
+  transcriptionBufferHasSpeech = false;
+  transcriptionBufferedAudioMs = 0;
+  transcriptionCommittedItemCount = 0;
+  nextTranscriptionItemSeparator = " ";
   transcriptionSpeechActive = false;
   transcriptionSilentMs = 0;
   transcriptionSilenceHoldMs = DEFAULT_TRANSCRIPTION_SILENCE_HOLD_MS;
@@ -1741,10 +2036,7 @@ function resetTranscriptionState() {
   transcriptionTranscriptWaiters = [];
 }
 
-ipcMain.on("translator:audio", (event, rawChunk: unknown) => {
-  if (!isTrustedSender(event)) {
-    return;
-  }
+function receiveAudio(rawChunk: unknown) {
   const chunk = validateAudioChunk(rawChunk);
   if (!chunk) {
     return;
@@ -1765,6 +2057,10 @@ ipcMain.on("translator:audio", (event, rawChunk: unknown) => {
   }
 
   if (!openRealtimeSockets().length) {
+    routeTranscriptionAudioChunk(chunk);
+    if (activeConfig?.latencyMode === "webrtc" && transcriptionSocket) {
+      return;
+    }
     pendingAudioChunks.push(chunk);
     if (pendingAudioChunks.length > latencyConfig.maxQueuedAudioChunks) {
       pendingAudioChunks = pendingAudioChunks.slice(-latencyConfig.maxQueuedAudioChunks);
@@ -1778,23 +2074,17 @@ ipcMain.on("translator:audio", (event, rawChunk: unknown) => {
   }
 
   sendAudioChunk(chunk);
-});
+}
 
-ipcMain.on("translator:exit-save-state", (event, rawState: unknown) => {
-  if (!isTrustedSender(event)) {
-    return;
-  }
+function updateExitSaveState(rawState: unknown) {
   const state = validateExitSaveState(rawState);
   if (!state) {
     return;
   }
   exitSaveState = state;
-});
+}
 
-ipcMain.on("translator:ui-log", (event, payload: { event?: unknown; data?: unknown }) => {
-  if (!isTrustedSender(event)) {
-    return;
-  }
+function logUiEvent(payload: { event?: unknown; data?: unknown }) {
   if (typeof payload?.event !== "string") {
     return;
   }
@@ -1803,13 +2093,16 @@ ipcMain.on("translator:ui-log", (event, payload: { event?: unknown; data?: unkno
   }
   const data = sanitizeLogData(payload.data);
   logLatency(payload.event, data);
-});
+}
 
 function sendAudioChunk(chunk: AudioChunk) {
   const sockets = openRealtimeSockets();
   if (!sockets.length) {
+    routeTranscriptionAudioChunk(chunk);
     return;
   }
+
+  routeTranscriptionAudioChunk(chunk);
 
   if (maxRealtimeBufferedAmount() > latencyConfig.maxWebSocketBufferBytes) {
     publishLatency({
@@ -1848,11 +2141,17 @@ function sendAudioChunk(chunk: AudioChunk) {
   for (const socket of sockets) {
     socket.send(message);
   }
+}
+
+function routeTranscriptionAudioChunk(chunk: AudioChunk) {
+  if (!transcriptionSocket && !pendingTranscriptionAudioChunks.length) {
+    return;
+  }
   sendTranscriptionAudioChunk(chunk);
 }
 
 function sendTranscriptionAudioChunk(chunk: AudioChunk) {
-  if (!transcriptionSocket || transcriptionSocket.readyState !== WebSocket.OPEN) {
+  if (!transcriptionSocket || transcriptionSocket.readyState !== websocketOpen) {
     pendingTranscriptionAudioChunks.push(chunk);
     if (pendingTranscriptionAudioChunks.length > latencyConfig.maxQueuedAudioChunks) {
       pendingTranscriptionAudioChunks = pendingTranscriptionAudioChunks.slice(-latencyConfig.maxQueuedAudioChunks);
@@ -1875,21 +2174,25 @@ function sendTranscriptionAudioChunk(chunk: AudioChunk) {
     })
   );
   transcriptionBufferHasAudio = true;
+  transcriptionBufferedAudioMs += chunk.chunkMs;
   updateTranscriptionCommitState(chunk);
 }
 
 function updateTranscriptionCommitState(chunk: AudioChunk) {
   if (chunk.rms >= TRANSCRIPTION_SPEECH_RMS_THRESHOLD) {
+    transcriptionBufferHasSpeech = true;
     if (!transcriptionSpeechActive && transcriptionLastSpeechEndedAt !== undefined) {
       const silentGapMs = Math.max(0, chunk.capturedAt - transcriptionLastSpeechEndedAt);
-      pendingTranscriptionItemSeparators.push(silentGapMs >= TRANSCRIPTION_LONG_BREAK_MS ? "\n\n" : "\n");
+      nextTranscriptionItemSeparator = silentGapMs >= TRANSCRIPTION_LONG_BREAK_MS ? "\n\n" : "\n";
     }
     transcriptionSpeechActive = true;
     transcriptionSilentMs = 0;
+    maybeCommitTranscriptionAudioBuffer("low_latency_audio_window");
     return;
   }
 
   if (!transcriptionSpeechActive) {
+    maybeCommitTranscriptionAudioBuffer("low_latency_audio_window");
     return;
   }
 
@@ -1899,28 +2202,58 @@ function updateTranscriptionCommitState(chunk: AudioChunk) {
     commitTranscriptionAudioBuffer("local_silence");
     transcriptionSpeechActive = false;
     transcriptionSilentMs = 0;
+    return;
+  }
+
+  maybeCommitTranscriptionAudioBuffer("low_latency_audio_window");
+}
+
+function maybeCommitTranscriptionAudioBuffer(reason: string) {
+  if (transcriptionBufferedAudioMs >= LOW_LATENCY_TRANSCRIPTION_COMMIT_MS) {
+    commitTranscriptionAudioBuffer(reason);
   }
 }
 
 function commitTranscriptionAudioBuffer(reason: string) {
-  if (!transcriptionSocket || transcriptionSocket.readyState !== WebSocket.OPEN || !transcriptionBufferHasAudio) {
+  if (!transcriptionSocket || transcriptionSocket.readyState !== websocketOpen || !transcriptionBufferHasAudio) {
+    return;
+  }
+  if (transcriptionBufferedAudioMs < MIN_TRANSCRIPTION_COMMIT_MS) {
+    logLatency("transcription_audio_commit_skipped_short_buffer", {
+      reason,
+      bufferedAudioMs: transcriptionBufferedAudioMs
+    });
     return;
   }
 
+  if (transcriptionCommittedItemCount > 0) {
+    pendingTranscriptionItemSeparators.push(nextTranscriptionItemSeparator);
+  }
+  const hadSpeech = transcriptionBufferHasSpeech;
   transcriptionSocket.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
   transcriptionBufferHasAudio = false;
-  logLatency("transcription_audio_committed", { reason });
+  transcriptionBufferHasSpeech = false;
+  transcriptionBufferedAudioMs = 0;
+  transcriptionCommittedItemCount += 1;
+  nextTranscriptionItemSeparator = " ";
+  logLatency("transcription_audio_committed", {
+    reason,
+    committedItems: transcriptionCommittedItemCount,
+    hadSpeech
+  });
 }
 
 async function stopTranscriptionSocket() {
   if (!transcriptionSocket) {
     return;
   }
-  const hadBufferedAudio = transcriptionBufferHasAudio;
+  const hadBufferedAudio = transcriptionBufferHasAudio && transcriptionBufferedAudioMs >= MIN_TRANSCRIPTION_COMMIT_MS;
   commitTranscriptionAudioBuffer("translator_stop");
   await waitForTranscriptionTranscriptSettled("translator_stop", hadBufferedAudio);
   flushTranscriptionTranscriptSnapshot("translator_stop");
-  closeTranscriptionSocket(1000, "translator stop");
+  if (!transcriptionSocketIsOpen()) {
+    closeTranscriptionSocket(1000, "translator stop");
+  }
 }
 
 async function waitForRealtimeTranscriptSettled(reason: string) {
@@ -1952,7 +2285,7 @@ async function waitForRealtimeTranscriptSettled(reason: string) {
 }
 
 function flushRealtimeTranscriptSnapshot(reason: string) {
-  if (!transcriptionSocket && sourceSegmentText) {
+  if ((!transcriptionSocket || !currentTranscriptionText()) && sourceSegmentText) {
     finalizedSourceText = joinTranscript(finalizedSourceText, sourceSegmentText);
     sourceSegmentText = "";
     sendEvent({ type: "sourceTranscript", text: finalizedSourceText, final: true });
@@ -2069,20 +2402,226 @@ function flushPendingTranscriptionAudio() {
 
 loadEnv();
 
-app.whenReady().then(createWindow);
+void startBridgeServer().catch((error: unknown) => {
+  console.error(error);
+  process.exit(1);
+});
 
-app.on("window-all-closed", () => {
+process.on("SIGINT", () => {
+  shutdown();
+  process.exit(0);
+});
+
+process.on("SIGTERM", () => {
+  shutdown();
+  process.exit(0);
+});
+
+function shutdown() {
   clearWarmCloseTimer();
   clearTranslationClientSecretRefreshTimer();
-  closeRealtimeSockets(1000, "app window closed");
-  closeTranscriptionSocket(1000, "app window closed");
-  if (process.platform !== "darwin") {
-    app.quit();
-  }
-});
+  closeRealtimeSockets(1000, "backend shutdown");
+  closeTranscriptionSocket(1000, "backend shutdown");
+}
 
-app.on("activate", () => {
-  if (BrowserWindow.getAllWindows().length === 0) {
-    createWindow();
+async function startBridgeServer() {
+  if (isBunRuntime()) {
+    const bun = (globalThis as {
+      Bun?: {
+        serve: (options: {
+          hostname: string;
+          port: number;
+          fetch: (request: Request, server: { upgrade: (request: Request) => boolean }) => Response | undefined;
+          websocket: {
+            open: (socket: BridgeSocket) => void;
+            message: (socket: BridgeSocket, data: string | Buffer) => void;
+            close: (socket: BridgeSocket) => void;
+          };
+        }) => { port: number };
+      };
+    }).Bun;
+    if (!bun) {
+      throw new Error("Bun runtime is unavailable.");
+    }
+    const server = bun.serve({
+      hostname: "127.0.0.1",
+      port: bridgePort,
+      fetch(request, server) {
+        const url = new URL(request.url);
+        if (url.pathname === "/health") {
+          return new Response(JSON.stringify({ ok: true }), {
+            headers: {
+              "Content-Type": "application/json",
+              "Access-Control-Allow-Origin": "*"
+            }
+          });
+        }
+        if (url.pathname === "/bridge") {
+          if (!bridgeRequestIsAuthorized(request.url, request.headers.get("Origin"))) {
+            return new Response("Forbidden", { status: 403 });
+          }
+          if (server.upgrade(request)) {
+            return undefined;
+          }
+        }
+        return new Response("Not found", { status: 404 });
+      },
+      websocket: {
+        open(socket) {
+          bridgeClients.add(socket);
+        },
+        message(socket, data) {
+          void handleBridgeMessage(socket, data.toString());
+        },
+        close(socket) {
+          bridgeClients.delete(socket);
+        }
+      }
+    });
+    logLatency("bridge_server_listening", {
+      port: server.port,
+      userDataDir: userDataDir(),
+      runtime: "bun"
+    });
+    return;
   }
-});
+
+  const server = http.createServer((request, response) => {
+    if (request.url === "/health") {
+      response.writeHead(200, {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*"
+      });
+      response.end(JSON.stringify({ ok: true }));
+      return;
+    }
+    response.writeHead(404);
+    response.end();
+  });
+  const { WebSocketServer } = await import("ws");
+  const wss = new WebSocketServer({
+    server,
+    path: "/bridge",
+    maxPayload: maxBridgeMessageBytes,
+    verifyClient(info, done) {
+      done(bridgeRequestIsAuthorized(info.req.url, info.origin));
+    }
+  });
+
+  wss.on("connection", (socket) => {
+    bridgeClients.add(socket);
+    socket.on("message", (data) => {
+      void handleBridgeMessage(socket, data.toString());
+    });
+    socket.on("close", () => {
+      bridgeClients.delete(socket);
+    });
+  });
+
+  server.listen(bridgePort, "127.0.0.1", () => {
+    logLatency("bridge_server_listening", {
+      port: bridgePort,
+      userDataDir: userDataDir(),
+      runtime: "node"
+    });
+  });
+}
+
+async function handleBridgeMessage(socket: BridgeSocket, raw: string) {
+  let message: unknown;
+  try {
+    message = JSON.parse(raw);
+  } catch {
+    return;
+  }
+  if (!isRecord(message) || typeof message.command !== "string") {
+    return;
+  }
+  const command = message.command;
+  const payload = message.payload;
+
+  if (message.id === undefined) {
+    void runBridgeCommand(command, payload).catch((error: unknown) => {
+      logLatency("bridge_fire_and_forget_error", {
+        command,
+        message: error instanceof Error ? error.message : "Bridge command failed."
+      });
+    });
+    return;
+  }
+
+  if (typeof message.id !== "string") {
+    return;
+  }
+
+  try {
+    const result = await runBridgeCommand(command, payload);
+    socket.send(JSON.stringify({ id: message.id, ok: true, result }));
+  } catch (error) {
+    const bridgeError = error instanceof Error ? error.message : "Bridge command failed.";
+    socket.send(JSON.stringify({ id: message.id, ok: false, error: bridgeError }));
+  }
+}
+
+async function runBridgeCommand(command: string, payload: unknown) {
+  switch (command) {
+    case "translator:warm":
+      return warmSession(payload);
+    case "translator:start":
+      return startSession(payload);
+    case "translator:start-translation-call":
+      return startTranslationCall(payload);
+    case "translator:stop":
+      return stopSession();
+    case "translator:get-api-key-status":
+      return apiKeyStatusCommand();
+    case "translator:get-api-pricing":
+      return apiPricingCommand();
+    case "translator:set-api-key":
+      return setApiKeyCommand(payload);
+    case "translator:open-api-key-page":
+      return openApiKeyPageCommand();
+    case "translator:meeting-transcribe":
+      return meetingTranscribeCommand(payload);
+    case "translator:save-meeting-audio-chunk":
+      return saveMeetingAudioChunkCommand(payload);
+    case "translator:exit-save-state":
+      updateExitSaveState(payload);
+      return undefined;
+    case "translator:audio":
+      receiveAudio(payload);
+      return undefined;
+    case "translator:ui-log":
+      logUiEvent(payload as { event?: unknown; data?: unknown });
+      return undefined;
+    case "translator:save-exit-texts":
+      if (!isRecord(payload) || typeof payload.directory !== "string") {
+        throw new Error("Save directory is required.");
+      }
+      return saveExitTexts(payload.directory);
+    default:
+      throw new Error(`Unknown bridge command: ${command}`);
+  }
+}
+
+function broadcast(payload: unknown) {
+  const serialized = JSON.stringify(payload);
+  for (const client of bridgeClients) {
+    if (client.readyState === undefined || client.readyState === websocketOpen) {
+      client.send(serialized);
+    }
+  }
+}
+
+function openExternal(url: string) {
+  const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
+  const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
+  return new Promise<void>((resolve, reject) => {
+    const child = spawn(opener, args, { stdio: "ignore", detached: true });
+    child.on("error", reject);
+    child.on("spawn", () => {
+      child.unref();
+      resolve();
+    });
+  });
+}

@@ -9,7 +9,7 @@
     "skipLibCheck": true,
     "outDir": "dist",
     "rootDir": "src",
-    "types": ["node", "electron"]
+    "types": ["node"]
   },
-  "include": ["src/main", "src/preload", "src/shared"]
+  "include": ["src/backend", "src/shared"]
 }

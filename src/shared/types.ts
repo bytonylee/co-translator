@@ -20,6 +20,7 @@ export type MeetingTranscriptionRequest = {
   base64Audio: string;
   mimeType: string;
   sourceLanguage: string;
+  targetLanguage: string;
 };
 
 export type MeetingAudioChunkSaveRequest = {

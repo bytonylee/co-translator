@@ -17,8 +17,8 @@ type WebRtcTranslatorOptions = {
   log: (event: string, data?: Record<string, unknown>) => void;
 };
 
-const SPEECH_RMS_THRESHOLD = 0.02;
-const SPEECH_END_RMS_THRESHOLD = 0.01;
+const SPEECH_RMS_THRESHOLD = 0.006;
+const SPEECH_END_RMS_THRESHOLD = 0.003;
 const SPEECH_END_HOLD_MS = 240;
 
 export async function getWebRtcSourceStream(deviceId: string) {

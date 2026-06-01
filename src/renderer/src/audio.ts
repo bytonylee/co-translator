@@ -5,13 +5,13 @@ export type AudioStreamer = {
 };
 
 const TARGET_SAMPLE_RATE = 24000;
-const SPEECH_RMS_THRESHOLD = 0.012;
+const SPEECH_RMS_THRESHOLD = 0.006;
 const PRE_ROLL_MS = 120;
 const SILENCE_HOLD_MS = 500;
 
 function chunkMsForLatency(mode: LatencyMode) {
   if (mode === "fast") {
-    return 10;
+    return 2.5;
   }
   if (mode === "stable") {
     return 40;
@@ -24,14 +24,12 @@ export async function createAudioStreamer(
   latencyMode: LatencyMode,
   onAudio: (chunk: AudioChunk) => void
 ): Promise<AudioStreamer> {
-  const chunkMs = chunkMsForLatency(latencyMode);
-  const preRollLimit = Math.max(1, Math.ceil(PRE_ROLL_MS / chunkMs));
-  const silenceHoldLimit = Math.max(1, Math.ceil(SILENCE_HOLD_MS / chunkMs));
-  let speechStartedAt: number | undefined;
-  let speaking = false;
-  let silentChunks = 0;
-  const preRoll: AudioChunk[] = [];
-  const stream = await navigator.mediaDevices.getUserMedia({
+  const stream = await createAudioInputStream(deviceId, latencyMode);
+  return createAudioStreamerFromStream(stream, latencyMode, onAudio, true);
+}
+
+export async function createAudioInputStream(deviceId: string, latencyMode: LatencyMode): Promise<MediaStream> {
+  return navigator.mediaDevices.getUserMedia({
     audio: {
       deviceId: deviceId ? { exact: deviceId } : undefined,
       echoCancellation: latencyMode !== "fast",
@@ -41,12 +39,27 @@ export async function createAudioStreamer(
       sampleRate: TARGET_SAMPLE_RATE
     }
   });
+}
+
+export async function createAudioStreamerFromStream(
+  stream: MediaStream,
+  latencyMode: LatencyMode,
+  onAudio: (chunk: AudioChunk) => void,
+  stopTracks = false
+): Promise<AudioStreamer> {
+  const chunkMs = chunkMsForLatency(latencyMode);
+  const preRollLimit = Math.max(1, Math.ceil(PRE_ROLL_MS / chunkMs));
+  const silenceHoldLimit = Math.max(1, Math.ceil(SILENCE_HOLD_MS / chunkMs));
+  let speechStartedAt: number | undefined;
+  let speaking = false;
+  let silentChunks = 0;
+  const preRoll: AudioChunk[] = [];
 
   const audioContext = new AudioContext({
     latencyHint: "interactive",
     sampleRate: TARGET_SAMPLE_RATE
   });
-  await audioContext.audioWorklet.addModule("/audio-worklet.js");
+  await audioContext.audioWorklet.addModule(new URL("audio-worklet.js", window.location.href).href);
   const source = audioContext.createMediaStreamSource(stream);
   const processor = new AudioWorkletNode(audioContext, "pcm16-downsampler", {
     processorOptions: {
@@ -124,7 +137,9 @@ export async function createAudioStreamer(
       processor.disconnect();
       mutedOutput.disconnect();
       source.disconnect();
-      stream.getTracks().forEach((track) => track.stop());
+      if (stopTracks) {
+        stream.getTracks().forEach((track) => track.stop());
+      }
       await audioContext.close();
     }
   };

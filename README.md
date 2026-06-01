@@ -1,8 +1,9 @@
-[English](./README.md) | [한국어](./README.ko.md) ![Version](https://img.shields.io/badge/version-0.0.1-333333?style=flat-square) [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-yellow.svg)](./LICENSE)
+[English](./README.md) | [한국어](./README.ko.md)
+![Version](https://img.shields.io/badge/version-0.0.2-333333?style=flat-square) [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-yellow.svg)](./LICENSE)
 
 # Co Translator
 
-Native desktop realtime translator for macOS and Windows. The app uses Electron, React, TypeScript, and OpenAI Realtime translation. The renderer handles microphone capture and UI. The Electron main process keeps the OpenAI API key out of the renderer.
+Native desktop realtime translator for macOS and Linux. The app uses Zero Native, React, TypeScript, and OpenAI Realtime translation. The renderer handles microphone capture and UI. A local backend sidecar keeps the OpenAI API key out of the renderer.
 
 > [!WARNING]
 > Windows OS has not been tested by the maintainer yet. Please check it on Windows and contribute fixes or notes to make the Windows build work well.
@@ -13,6 +14,7 @@ Requirements:
 
 - Node.js 20 or newer
 - npm
+- Zig 0.16.0 or newer
 - An OpenAI API key with Realtime API access
 
 Run these commands from Terminal:
@@ -128,14 +130,24 @@ Set this in `.env` and `.env.local` to reduce Fastest-mode translation cost:
 OPENAI_REALTIME_RACE_SOCKETS=1
 ```
 
-## Build Native Installers
+## Build Native Packages
 
 ```bash
 npm run dist:mac
-npm run dist:win
+npm run dist:linux
 ```
 
-Cross-building Windows installers from macOS may require Wine. Building each target on its own OS is the most reliable path.
+Native package scripts build Zero Native with `ReleaseSmall` and tracing disabled for the lowest shipping RSS and bridge overhead. Zero Native's macOS path is fully supported. Linux packaging is directory-based. Windows support in Zero Native is still early, so this project no longer publishes an Electron Windows installer.
+
+## Shell Benchmark Report
+
+Generate the optimized Electron-vs-Zero Native memory and local bridge latency report:
+
+```bash
+npm run benchmark:shells
+```
+
+The report is written to `reports/electron-vs-zero-native.html`. It uses the recorded Electron migration baseline and measures the optimized Zero Native process tree built with `ReleaseSmall` and `-Dtrace=off`.
 
 ## Notes
 

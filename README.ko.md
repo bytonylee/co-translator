@@ -1,11 +1,12 @@
-[English](./README.md) | [한국어](./README.ko.md) ![Version](https://img.shields.io/badge/version-0.0.1-333333?style=flat-square) [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-yellow.svg)](./LICENSE)
+[English](./README.md) | [한국어](./README.ko.md)
+![Version](https://img.shields.io/badge/version-0.0.2-333333?style=flat-square) [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-yellow.svg)](./LICENSE)
 
 # Co Translator
 
-macOS와 Windows용 네이티브 실시간 번역 데스크톱 앱입니다. Electron, React, TypeScript, OpenAI Realtime translation을 사용합니다. 마이크와 화면은 렌더러가 처리하고, OpenAI API 키는 Electron 메인 프로세스에만 보관합니다.
+macOS와 Linux용 네이티브 실시간 번역 데스크톱 앱입니다. Zero Native, React, TypeScript, OpenAI Realtime translation을 사용합니다. 마이크와 화면은 렌더러가 처리하고, OpenAI API 키는 로컬 백엔드 사이드카에만 보관합니다.
 
 > [!WARNING]
-> Windows OS는 아직 메인테이너가 테스트하지 않았습니다. Windows에서 직접 확인해 주시고, Windows 빌드가 잘 동작하도록 수정 사항이나 확인 내용을 기여해 주세요.
+> Zero Native의 Windows 지원은 아직 초기 단계입니다. 이 프로젝트는 더 이상 Electron Windows 설치 파일을 만들지 않습니다.
 
 ## 터미널에서 설치하기
 
@@ -13,6 +14,7 @@ macOS와 Windows용 네이티브 실시간 번역 데스크톱 앱입니다. Ele
 
 - Node.js 20 이상
 - npm
+- Zig 0.16.0 이상
 - Realtime API를 사용할 수 있는 OpenAI API 키
 
 터미널에서 아래 명령어를 실행하세요.
@@ -132,10 +134,20 @@ OPENAI_REALTIME_RACE_SOCKETS=1
 
 ```bash
 npm run dist:mac
-npm run dist:win
+npm run dist:linux
 ```
 
-macOS에서 Windows 설치 파일을 크로스 빌드하려면 Wine이 필요할 수 있습니다. 각 OS에서 직접 빌드하는 방식이 가장 안정적입니다.
+네이티브 패키지 스크립트는 배포 시 RSS와 브리지 오버헤드를 낮추기 위해 Zero Native를 `ReleaseSmall` 및 tracing 비활성화 상태로 빌드합니다. Zero Native의 macOS 패키징 경로는 정식 지원됩니다. Linux 패키징은 디렉터리 기반입니다.
+
+## 셸 벤치마크 리포트
+
+최적화된 Electron-vs-Zero Native 메모리 사용량 및 로컬 브리지 지연 시간 리포트를 생성하려면:
+
+```bash
+npm run benchmark:shells
+```
+
+리포트는 `reports/electron-vs-zero-native.html`에 저장됩니다. 리포트는 기록된 Electron migration baseline을 사용하고, `ReleaseSmall` 및 `-Dtrace=off`로 빌드한 최적화된 Zero Native 프로세스 트리를 측정합니다.
 
 ## 참고
 

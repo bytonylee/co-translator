@@ -1,0 +1,35 @@
+.{
+    .id = "com.cotranslator.desktop",
+    .name = "co-translator",
+    .display_name = "Co Translator",
+    .version = "0.0.1",
+    .icons = .{ "assets/icon.icns" },
+    .platforms = .{ "macos", "linux" },
+    .permissions = .{ "microphone", "network", "filesystem" },
+    .capabilities = .{ "webview", "network", "filesystem" },
+    .frontend = .{
+        .dist = "dist/renderer",
+        .entry = "index.html",
+        .spa_fallback = true,
+        .dev = .{
+            .url = "http://127.0.0.1:5173/",
+            .command = .{ "npm", "run", "dev:frontend", "--", "--host", "127.0.0.1" },
+            .ready_path = "/",
+            .timeout_ms = 30000,
+        },
+    },
+    .security = .{
+        .navigation = .{
+            .allowed_origins = .{ "zero://app", "zero://inline", "http://127.0.0.1:5173" },
+            .external_links = .{
+                .action = "open_system_browser",
+                .allowed_urls = .{ "https://platform.openai.com/*" },
+            },
+        },
+    },
+    .web_engine = "system",
+    .cef = .{ .dir = "third_party/cef/macos", .auto_install = false },
+    .windows = .{
+        .{ .label = "main", .title = "Co Translator", .width = 1080, .height = 760, .restore_state = true },
+    },
+}
