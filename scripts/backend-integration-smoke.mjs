@@ -7,6 +7,7 @@ import WebSocket, { WebSocketServer } from "ws";
 
 const bridgePort = 41875;
 const mockPort = 41876;
+const bridgeToken = "integration-smoke-bridge-token";
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "co-translator-smoke-"));
 const mockHttpBase = `http://127.0.0.1:${mockPort}`;
 const mockWsBase = `ws://127.0.0.1:${mockPort}`;
@@ -142,8 +143,10 @@ function backendEnv() {
   return {
     ...process.env,
     CO_TRANSLATOR_BRIDGE_PORT: String(bridgePort),
+    CO_TRANSLATOR_BRIDGE_TOKEN: bridgeToken,
     CO_TRANSLATOR_USER_DATA_DIR: tempDir,
     CO_TRANSLATOR_LOG_DIR: path.join(tempDir, "logs"),
+    CO_TRANSLATOR_ALLOW_OPENAI_BASE_URL_OVERRIDE: "1",
     OPENAI_API_KEY: "sk-test-integration",
     OPENAI_API_BASE_URL: mockHttpBase,
     OPENAI_REALTIME_WS_BASE_URL: mockWsBase,
@@ -165,11 +168,7 @@ async function waitForBackend() {
 }
 
 async function connectBridge() {
-  const socket = new WebSocket(`ws://127.0.0.1:${bridgePort}/bridge`);
-  await new Promise((resolve, reject) => {
-    socket.once("open", resolve);
-    socket.once("error", reject);
-  });
+  const socket = await openBridge({ label: "main bridge client", origin: "http://127.0.0.1:5173" });
   let id = 0;
   const events = [];
   socket.on("message", (raw) => {
@@ -195,6 +194,57 @@ async function connectBridge() {
   return { socket, call, send, events };
 }
 
+function bridgeUrl(token = bridgeToken) {
+  if (!token) {
+    return `ws://127.0.0.1:${bridgePort}/bridge`;
+  }
+  return `ws://127.0.0.1:${bridgePort}/bridge?token=${encodeURIComponent(token)}`;
+}
+
+async function openBridge({ token = bridgeToken, origin, label }) {
+  const options = origin === undefined ? undefined : { origin };
+  const socket = new WebSocket(bridgeUrl(token), options);
+  await new Promise((resolve, reject) => {
+    socket.once("open", resolve);
+    socket.once("unexpected-response", (_request, response) => {
+      reject(new Error(`${label} was rejected with status ${response.statusCode}.`));
+    });
+    socket.once("error", reject);
+  });
+  return socket;
+}
+
+async function assertBridgeRejected({ token = bridgeToken, origin, label }) {
+  const options = origin === undefined ? undefined : { origin };
+  const socket = new WebSocket(bridgeUrl(token), options);
+  await new Promise((resolve, reject) => {
+    socket.once("open", () => {
+      socket.close();
+      reject(new Error(`Bridge accepted ${label}.`));
+    });
+    socket.once("unexpected-response", (_request, response) => {
+      if (response.statusCode === 401 || response.statusCode === 403) {
+        resolve();
+      } else {
+        reject(new Error(`Bridge rejected missing token with unexpected status ${response.statusCode}.`));
+      }
+    });
+    socket.once("error", resolve);
+  });
+}
+
+async function assertBridgeAuthPolicy() {
+  await assertBridgeRejected({ token: "", label: "a WebSocket without a token" });
+  await assertBridgeRejected({ token: "wrong-token", origin: "http://127.0.0.1:5173", label: "an allowed origin with a wrong token" });
+  await assertBridgeRejected({ origin: "https://evil.example", label: "a disallowed remote origin" });
+  await assertBridgeRejected({ origin: "null", label: "a null origin" });
+
+  const allowedOriginSocket = await openBridge({ origin: "http://127.0.0.1:5173", label: "allowed dev origin" });
+  allowedOriginSocket.close();
+  const localClientSocket = await openBridge({ label: "local non-browser client" });
+  localClientSocket.close();
+}
+
 async function main() {
   const mock = await startMockOpenAi();
   const backend = startBackend();
@@ -203,6 +253,7 @@ async function main() {
   backend.stderr.on("data", (chunk) => { backendOutput += chunk.toString(); });
   try {
     await waitForBackend();
+    await assertBridgeAuthPolicy();
     const bridge = await connectBridge();
     const config = {
       sourceLanguage: "Korean",
