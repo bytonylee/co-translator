@@ -3,6 +3,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { languageCode, languageOptions, targetLanguageOptions, transcriptionLanguageCode } from "../shared/languages.js";
 import {
@@ -45,13 +46,15 @@ const STOP_TRANSCRIPT_SETTLE_QUIET_MS = 350;
 const STOP_TRANSCRIPT_SETTLE_MAX_MS = 4000;
 const DEFAULT_WARM_IDLE_TIMEOUT_MS = 300_000;
 const bridgePort = Number(process.env.CO_TRANSLATOR_BRIDGE_PORT || 41873);
-const openAiApiBaseUrl = (process.env.OPENAI_API_BASE_URL || "https://api.openai.com").replace(/\/$/, "");
-const openAiRealtimeWsBaseUrl = (process.env.OPENAI_REALTIME_WS_BASE_URL || "wss://api.openai.com").replace(/\/$/, "");
+const defaultOpenAiApiBaseUrl = "https://api.openai.com";
+const defaultOpenAiRealtimeWsBaseUrl = "wss://api.openai.com";
+const allowOpenAiBaseUrlOverrideFlag = "CO_TRANSLATOR_ALLOW_OPENAI_BASE_URL_OVERRIDE";
 const maxApiKeyLength = 4096;
 const maxAudioBase64Length = 64 * 1024;
 const maxMeetingAudioChunkBase64Length = 6 * 1024 * 1024;
 const maxMeetingAudioBase64Length = 36 * 1024 * 1024;
 const maxExitSaveTextLength = 2 * 1024 * 1024;
+const maxBridgeMessageBytes = 40 * 1024 * 1024;
 const validLatencyModes = new Set<LatencyMode>(["fast", "webrtc", "balanced", "stable"]);
 const validSourceLanguages = new Set<string>(languageOptions);
 const validTargetLanguages = new Set<string>(targetLanguageOptions);
@@ -74,6 +77,8 @@ type BridgeSocket = {
 };
 
 const bridgeClients = new Set<BridgeSocket>();
+let bridgeTokenValue: string | null = null;
+let runtimeApiKey: string | null = null;
 let realtimeSocket: RealtimeSocket | null = null;
 let realtimeSockets: RealtimeSocket[] = [];
 let realtimeWinnerLane: number | undefined;
@@ -125,7 +130,7 @@ let cachedTranslationClientSecret: {
 } | null = null;
 
 type StoredApiKey = {
-  encoding: "local";
+  encoding: "local" | "plaintext-v1";
   value: string;
 };
 
@@ -424,6 +429,36 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function getBridgeToken() {
+  bridgeTokenValue ??= process.env.CO_TRANSLATOR_BRIDGE_TOKEN?.trim() || randomBytes(32).toString("hex");
+  return bridgeTokenValue;
+}
+
+function secureTokenEquals(actual: string, expected: string) {
+  const actualBuffer = Buffer.from(actual);
+  const expectedBuffer = Buffer.from(expected);
+  return actualBuffer.length === expectedBuffer.length && timingSafeEqual(actualBuffer, expectedBuffer);
+}
+
+function bridgeRequestIsAuthorized(rawUrl: string | undefined, origin: string | undefined | null) {
+  const url = new URL(rawUrl || "/bridge", "http://127.0.0.1");
+  const token = url.searchParams.get("token") || "";
+  if (!secureTokenEquals(token, getBridgeToken())) {
+    return false;
+  }
+  if (!origin) {
+    return true;
+  }
+  return new Set([
+    "zero://app",
+    "zero://inline",
+    "file://local",
+    "file://",
+    "http://127.0.0.1:5173",
+    "http://localhost:5173"
+  ]).has(origin);
+}
+
 function validateConfig(value: unknown): TranslatorConfig {
   if (!isRecord(value)) {
     throw new Error("Translator config must be an object.");
@@ -603,6 +638,33 @@ function loadEnv() {
   }
 }
 
+function openAiApiBaseUrl() {
+  return validatedOpenAiBaseUrl("OPENAI_API_BASE_URL", defaultOpenAiApiBaseUrl, "https:");
+}
+
+function openAiRealtimeWsBaseUrl() {
+  return validatedOpenAiBaseUrl("OPENAI_REALTIME_WS_BASE_URL", defaultOpenAiRealtimeWsBaseUrl, "wss:");
+}
+
+function validatedOpenAiBaseUrl(envName: string, fallback: string, requiredProtocol: "https:" | "wss:") {
+  const rawValue = process.env[envName]?.trim() || fallback;
+  const url = new URL(rawValue);
+  const overrideAllowed = process.env[allowOpenAiBaseUrlOverrideFlag] === "1";
+  const developmentProtocolAllowed = overrideAllowed && (
+    (requiredProtocol === "https:" && url.protocol === "http:") ||
+    (requiredProtocol === "wss:" && url.protocol === "ws:")
+  );
+  if (url.protocol !== requiredProtocol && !developmentProtocolAllowed) {
+    throw new Error(`${envName} must use ${requiredProtocol.replace(":", "")}.`);
+  }
+  const normalized = url.toString().replace(/\/$/, "");
+  const defaultUrl = new URL(fallback);
+  if (url.hostname !== defaultUrl.hostname && !overrideAllowed) {
+    throw new Error(`${envName} can only target ${defaultUrl.hostname} unless ${allowOpenAiBaseUrlOverrideFlag}=1.`);
+  }
+  return normalized;
+}
+
 function parseEnvFile(contents: string) {
   const parsed: Record<string, string> = {};
   for (const rawLine of contents.split(/\r?\n/)) {
@@ -657,9 +719,9 @@ function readStoredApiKey(): { apiKey: string; storage: ApiKeyStatus["storage"] 
     if (!stored.value) {
       return null;
     }
-    if (stored.encoding === "local" && typeof stored.value === "string") {
+    if ((stored.encoding === "local" || stored.encoding === "plaintext-v1") && typeof stored.value === "string") {
       return {
-        apiKey: stored.value,
+        apiKey: validateApiKey(stored.value),
         storage: "local"
       };
     }
@@ -674,13 +736,13 @@ function readStoredApiKey(): { apiKey: string; storage: ApiKeyStatus["storage"] 
 function writeStoredApiKey(apiKey: string): ApiKeyStatus {
   const trimmedApiKey = validateApiKey(apiKey);
   const stored: StoredApiKey = {
-    encoding: "local",
+    encoding: "plaintext-v1",
     value: trimmedApiKey
   };
 
-  fs.mkdirSync(userDataDir(), { recursive: true });
+  fs.mkdirSync(userDataDir(), { recursive: true, mode: 0o700 });
   fs.writeFileSync(apiKeyStorePath(), JSON.stringify(stored, null, 2), { encoding: "utf8", mode: 0o600 });
-  process.env.OPENAI_API_KEY = trimmedApiKey;
+  runtimeApiKey = trimmedApiKey;
   cachedTranslationClientSecret = null;
   clearTranslationClientSecretRefreshTimer();
   if (!isStreaming) {
@@ -695,6 +757,12 @@ function writeStoredApiKey(apiKey: string): ApiKeyStatus {
 }
 
 function getApiKeyStatus(): ApiKeyStatus {
+  if (runtimeApiKey) {
+    return {
+      configured: true,
+      storage: "local"
+    };
+  }
   const stored = readStoredApiKey();
   if (stored?.apiKey) {
     return {
@@ -703,10 +771,18 @@ function getApiKeyStatus(): ApiKeyStatus {
     };
   }
   if (process.env.OPENAI_API_KEY) {
-    return {
-      configured: true,
-      storage: "environment"
-    };
+    try {
+      validateApiKey(process.env.OPENAI_API_KEY);
+      return {
+        configured: true,
+        storage: "environment"
+      };
+    } catch {
+      return {
+        configured: false,
+        storage: "none"
+      };
+    }
   }
   return {
     configured: false,
@@ -715,7 +791,7 @@ function getApiKeyStatus(): ApiKeyStatus {
 }
 
 function getApiKey() {
-  const apiKey = readStoredApiKey()?.apiKey || process.env.OPENAI_API_KEY;
+  const apiKey = runtimeApiKey || readStoredApiKey()?.apiKey || (process.env.OPENAI_API_KEY ? validateApiKey(process.env.OPENAI_API_KEY) : "");
   if (!apiKey) {
     logLatency("missing_api_key");
     throw new Error("OPENAI_API_KEY is missing. Add it in API key settings.");
@@ -748,7 +824,7 @@ async function getTranslationClientSecret(config: TranslatorConfig) {
     targetLanguageCode: languageCode(config.targetLanguage)
   });
 
-  const response = await fetch(`${openAiApiBaseUrl}/v1/realtime/translations/client_secrets`, {
+  const response = await fetch(`${openAiApiBaseUrl()}/v1/realtime/translations/client_secrets`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${getApiKey()}`,
@@ -822,7 +898,7 @@ async function transcribeMeetingAudio(request: MeetingTranscriptionRequest): Pro
     form.append("language", language);
   }
 
-  const response = await fetch(`${openAiApiBaseUrl}/v1/audio/transcriptions`, {
+  const response = await fetch(`${openAiApiBaseUrl()}/v1/audio/transcriptions`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${getApiKey()}`,
@@ -864,7 +940,7 @@ async function translateMeetingSegments(result: MeetingTranscriptionResult, requ
     segments: result.segments.length
   });
 
-  const response = await fetch(`${openAiApiBaseUrl}/v1/responses`, {
+  const response = await fetch(`${openAiApiBaseUrl()}/v1/responses`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${getApiKey()}`,
@@ -1123,7 +1199,7 @@ function connectRealtime(config: TranslatorConfig, readyState: "connected" | "wa
 
   return new Promise<void>((resolve, reject) => {
     const model = process.env.OPENAI_REALTIME_MODEL || "gpt-realtime-translate";
-    const url = `${openAiRealtimeWsBaseUrl}/v1/realtime/translations?model=${encodeURIComponent(model)}`;
+    const url = `${openAiRealtimeWsBaseUrl()}/v1/realtime/translations?model=${encodeURIComponent(model)}`;
     const raceCount = realtimeRaceSocketCount(config);
     let settled = false;
     let sessionReadyTimeout: NodeJS.Timeout | undefined;
@@ -1298,7 +1374,7 @@ function connectTranscription(config: TranslatorConfig) {
 
   return new Promise<void>((resolve, reject) => {
     const model = process.env.OPENAI_REALTIME_TRANSCRIPTION_MODEL || "gpt-realtime-whisper";
-    const url = `${openAiRealtimeWsBaseUrl}/v1/realtime?intent=transcription`;
+    const url = `${openAiRealtimeWsBaseUrl()}/v1/realtime?intent=transcription`;
     const language = transcriptionLanguageCode(config.sourceLanguage);
     const connectStartedAt = Date.now();
     let settled = false;
@@ -2380,8 +2456,13 @@ async function startBridgeServer() {
             }
           });
         }
-        if (url.pathname === "/bridge" && server.upgrade(request)) {
-          return undefined;
+        if (url.pathname === "/bridge") {
+          if (!bridgeRequestIsAuthorized(request.url, request.headers.get("Origin"))) {
+            return new Response("Forbidden", { status: 403 });
+          }
+          if (server.upgrade(request)) {
+            return undefined;
+          }
         }
         return new Response("Not found", { status: 404 });
       },
@@ -2418,7 +2499,14 @@ async function startBridgeServer() {
     response.end();
   });
   const { WebSocketServer } = await import("ws");
-  const wss = new WebSocketServer({ server, path: "/bridge" });
+  const wss = new WebSocketServer({
+    server,
+    path: "/bridge",
+    maxPayload: maxBridgeMessageBytes,
+    verifyClient(info, done) {
+      done(bridgeRequestIsAuthorized(info.req.url, info.origin));
+    }
+  });
 
   wss.on("connection", (socket) => {
     bridgeClients.add(socket);
