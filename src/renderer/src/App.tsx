@@ -1487,7 +1487,7 @@ function apiKeyStatusMessage(storage: "encrypted" | "local" | "environment" | "n
     return "API key is stored on this device with OS encryption.";
   }
   if (storage === "local") {
-    return "API key is stored on this device.";
+    return "API key is stored as a local plaintext file on this device.";
   }
   if (storage === "environment") {
     return "API key is loaded from the local environment.";
